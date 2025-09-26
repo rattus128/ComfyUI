@@ -98,9 +98,11 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else None
 
     def forward(self, x):
-        return F.normalize(
-            x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma.to(x) + (self.bias.to(x) if self.bias is not None else 0)
-
+        x = F.normalize(x, dim=(1 if self.channel_first else -1))
+        x.mul_(self.gamma.to(x) * self.scale)
+        if self.bias is not None:
+            x.add_(self.bias.to(x))
+        return x
 
 class Resample(nn.Module):
 
