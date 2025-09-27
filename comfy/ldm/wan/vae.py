@@ -58,6 +58,25 @@ def cache_causal_conv3d(x_list, layer, feat_cache=None, feat_idx=None):
     return x
 
 
+#rearrange a tensor to 2d by combining the time dimension to the batch
+
+def rearrange_3d_to_2d(x):
+    t = x.shape[2]
+    # This OP has a habit of being part of the VRAM peak, so in the case of
+    # B = 1 we take advantage of being able to do this as a squeeze + permute
+    # with no deep copy.
+    if x.shape[0] == 1:
+        return rearrange(x.squeeze(0), 'c t h w -> t c h w'), t
+    else:
+        return rearrange(x, 'b c t h w -> (b t) c h w'), t
+
+def rearrange_2d_to_3d(x, t):
+    if x.shape[0] == t:
+        return rearrange(x, 't c h w -> c t h w').unsqueeze(0)
+    else:
+        return rearrange(x, '(b t) c h w -> b c t h w')
+
+
 class CausalConv3d(ops.Conv3d):
     """
     Causal 3d convolusion.
@@ -176,10 +195,10 @@ class Resample(nn.Module):
                     x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]),
                                     3)
                     x = x.reshape(b, c, t * 2, h, w)
-        t = x.shape[2]
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
+
+        x, t = rearrange_3d_to_2d(x)
         x = self.resample(x)
-        x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
+        x = rearrange_2d_to_3d(x, t)
 
         if self.mode == 'downsample3d':
             if feat_cache is not None:
@@ -242,8 +261,7 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x):
         identity = x
-        b, c, t, h, w = x.size()
-        x = rearrange(x, 'b c t h w -> (b t) c h w')
+        x, t = rearrange_3d_to_2d(x)
         x = self.norm(x)
         # compute query, key, value
 
@@ -252,7 +270,7 @@ class AttentionBlock(nn.Module):
 
         # output
         x = self.proj(x)
-        x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
+        x = rearrange_2d_to_3d(x, t)
         return x + identity
 
 
