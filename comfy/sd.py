@@ -650,16 +650,17 @@ class VAE:
                     pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
                 pixel_samples[x:x+batch_number] = out
         except model_management.OOM_EXCEPTION:
-            logging.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
-            dims = samples_in.ndim - 2
-            if dims == 1 or self.extra_1d_channel is not None:
-                pixel_samples = self.decode_tiled_1d(samples_in)
-            elif dims == 2:
-                pixel_samples = self.decode_tiled_(samples_in)
-            elif dims == 3:
-                tile = 256 // self.spacial_compression_decode()
-                overlap = tile // 4
-                pixel_samples = self.decode_tiled_3d(samples_in, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
+            raise
+            #logging.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
+            #dims = samples_in.ndim - 2
+            #if dims == 1 or self.extra_1d_channel is not None:
+            #    pixel_samples = self.decode_tiled_1d(samples_in)
+            #elif dims == 2:
+            #    pixel_samples = self.decode_tiled_(samples_in)
+            #elif dims == 3:
+            #    tile = 256 // self.spacial_compression_decode()
+            #    overlap = tile // 4
+            #    pixel_samples = self.decode_tiled_3d(samples_in, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
 
         pixel_samples = pixel_samples.to(self.output_device).movedim(1,-1)
         return pixel_samples
@@ -717,15 +718,16 @@ class VAE:
                 samples[x:x + batch_number] = out
 
         except model_management.OOM_EXCEPTION:
-            logging.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
-            if self.latent_dim == 3:
-                tile = 256
-                overlap = tile // 4
-                samples = self.encode_tiled_3d(pixel_samples, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
-            elif self.latent_dim == 1 or self.extra_1d_channel is not None:
-                samples = self.encode_tiled_1d(pixel_samples)
-            else:
-                samples = self.encode_tiled_(pixel_samples)
+            raise
+            #logging.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
+            #if self.latent_dim == 3:
+            #    tile = 256
+            #    overlap = tile // 4
+            #    samples = self.encode_tiled_3d(pixel_samples, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
+            #elif self.latent_dim == 1 or self.extra_1d_channel is not None:
+            #    samples = self.encode_tiled_1d(pixel_samples)
+            #else:
+            #    samples = self.encode_tiled_(pixel_samples)
 
         return samples
 
