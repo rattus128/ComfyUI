@@ -14,6 +14,49 @@ ops = comfy.ops.disable_weight_init
 
 CACHE_T = 2
 
+def cache_causal_conv3d(x_list, layer, feat_cache=None, feat_idx=None):
+
+    if not isinstance(layer, ops.Conv3d) or feat_cache is None:
+        return layer(x_list[0])
+
+    x = x_list[0]
+    x_list.clear() # remove caller handle on x
+
+    ##Xf Comments indicate the VRAM usage in latent frames. This algorithm
+    #peaks at 12f in VRAM for the worst case intermediate state.
+
+    ##6f starting frames in VRAM counting x = 4 + feat_cache = 2
+
+    idx = feat_idx[0]
+
+    cache_x_frames = min(CACHE_T, x.shape[2])
+
+    if feat_cache[idx] is None:
+        x = F.pad(x,(0, 0, 0, 0, 2, 0)) ##12f peak / 8f after
+    else:
+        shape_pad = list(x.shape)
+        shape_pad[2] = 2 - feat_cache[idx].shape[2]
+        x = torch.cat([torch.zeros(*shape_pad, device=x.device, dtype=x.dtype),
+                       feat_cache[idx],
+                       x], dim=2) ##12f peak / 8f after
+
+    cache_x = x[:, :, -cache_x_frames:, :, :]
+    if cache_x_frames < CACHE_T and feat_cache[idx] is not None:
+        # cache last frame of last two chunk
+        feat_cache[idx] = torch.cat([
+            feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
+                cache_x.device), cache_x
+        ],
+                            dim=2)
+    else:
+        feat_cache[idx] = None #6f
+        feat_cache[idx] = cache_x.clone() ##8f
+    feat_idx[0] += 1
+
+    x = layer(x) ##12f peak / 6f result
+
+    return x
+
 
 class CausalConv3d(ops.Conv3d):
     """
@@ -166,30 +209,17 @@ class ResidualBlock(nn.Module):
         # layers
         self.residual = nn.Sequential(
             RMS_norm(in_dim, images=False), nn.SiLU(),
-            CausalConv3d(in_dim, out_dim, 3, padding=1),
+            ops.Conv3d(in_dim, out_dim, 3, padding=(0, 1, 1)),
             RMS_norm(out_dim, images=False), nn.SiLU(), nn.Dropout(dropout),
-            CausalConv3d(out_dim, out_dim, 3, padding=1))
+            ops.Conv3d(out_dim, out_dim, 3, padding=(0, 1, 1)))
         self.shortcut = CausalConv3d(in_dim, out_dim, 1) \
             if in_dim != out_dim else nn.Identity()
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         old_x = x
         for layer in self.residual:
-            if isinstance(layer, CausalConv3d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat([
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                            cache_x.device), cache_x
-                    ],
-                                        dim=2)
-                x = layer(x, cache_list=feat_cache, cache_idx=idx)
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
+            x = [x] #put x behind indirection so callee can free our copy on us
+            x = cache_causal_conv3d(x, layer, feat_cache, feat_idx)        
         return x + self.shortcut(old_x)
 
 
@@ -247,7 +277,7 @@ class Encoder3d(nn.Module):
         scale = 1.0
 
         # init block
-        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
+        self.conv1 = ops.Conv3d(3, dims[0], 3, padding=(0, 1, 1))
 
         # downsample blocks
         downsamples = []
@@ -275,24 +305,11 @@ class Encoder3d(nn.Module):
         # output blocks
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False), nn.SiLU(),
-            CausalConv3d(out_dim, z_dim, 3, padding=1))
+            ops.Conv3d(out_dim, z_dim, 3, padding=(0, 1, 1)))
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat([
-                    feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                        cache_x.device), cache_x
-                ],
-                                    dim=2)
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
-        else:
-            x = self.conv1(x)
+        x = [x] #put x behind indirection so callee can free our copy on us
+        x = cache_causal_conv3d(x, self.conv1, feat_cache, feat_idx)
 
         ## downsamples
         for layer in self.downsamples:
@@ -310,21 +327,8 @@ class Encoder3d(nn.Module):
 
         ## head
         for layer in self.head:
-            if isinstance(layer, CausalConv3d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat([
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                            cache_x.device), cache_x
-                    ],
-                                        dim=2)
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
+            x = [x] #put x behind indirection so callee can free our copy on us
+            x = cache_causal_conv3d(x, layer, feat_cache, feat_idx)
         return x
 
 
@@ -351,7 +355,7 @@ class Decoder3d(nn.Module):
         scale = 1.0 / 2**(len(dim_mult) - 2)
 
         # init block
-        self.conv1 = CausalConv3d(z_dim, dims[0], 3, padding=1)
+        self.conv1 = ops.Conv3d(z_dim, dims[0], 3, padding=(0, 1, 1))
 
         # middle blocks
         self.middle = nn.Sequential(
@@ -380,25 +384,12 @@ class Decoder3d(nn.Module):
         # output blocks
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False), nn.SiLU(),
-            CausalConv3d(out_dim, 3, 3, padding=1))
+            ops.Conv3d(out_dim, 3, 3, padding=(0, 1, 1)))
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         ## conv1
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat([
-                    feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                        cache_x.device), cache_x
-                ],
-                                    dim=2)
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
-        else:
-            x = self.conv1(x)
+        x = [x] #put x behind indirection so callee can free our copy on us
+        x = cache_causal_conv3d(x, self.conv1, feat_cache, feat_idx)
 
         ## middle
         for layer in self.middle:
@@ -416,28 +407,15 @@ class Decoder3d(nn.Module):
 
         ## head
         for layer in self.head:
-            if isinstance(layer, CausalConv3d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat([
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                            cache_x.device), cache_x
-                    ],
-                                        dim=2)
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
+            x = [x] #put x behind indirection so callee can free our copy on us
+            x = cache_causal_conv3d(x, layer, feat_cache, feat_idx)
         return x
 
 
 def count_conv3d(model):
     count = 0
     for m in model.modules():
-        if isinstance(m, CausalConv3d):
+        if isinstance(m, ops.Conv3d):
             count += 1
     return count
 
