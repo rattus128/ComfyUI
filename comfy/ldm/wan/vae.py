@@ -1,3 +1,5 @@
+import time
+
 # original version: https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/vae.py
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
@@ -468,6 +470,8 @@ class WanVAE(nn.Module):
                                  attn_scales, self.temperal_upsample, dropout)
 
     def encode(self, x):
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
         self.clear_cache()
         ## cache
         t = x.shape[2]
@@ -488,9 +492,13 @@ class WanVAE(nn.Module):
                 out = torch.cat([out, out_], 2)
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         self.clear_cache()
+        print(f"encode time {time.time() - start_time}")
+        print(f"Peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
         return mu
 
     def decode(self, z):
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
         self.clear_cache()
         # z: [b,c,t,h,w]
 
@@ -510,6 +518,8 @@ class WanVAE(nn.Module):
                     feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2)
         self.clear_cache()
+        print(f"decode time {time.time() - start_time}")
+        print(f"Peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
         return out
 
     def clear_cache(self):
