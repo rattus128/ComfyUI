@@ -22,9 +22,8 @@ class CausalConv3d(ops.Conv3d):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._padding = (self.padding[2], self.padding[2], self.padding[1],
-                         self.padding[1], 2 * self.padding[0], 0)
-        self.padding = (0, 0, 0)
+        self._padding = (0, 0, 0, 0, 2 * self.padding[0], 0)
+        self.padding = (0, self.padding[1], self.padding[2])
 
     def forward(self, x, cache_x=None, cache_list=None, cache_idx=None):
         if cache_list is not None:
@@ -37,7 +36,8 @@ class CausalConv3d(ops.Conv3d):
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
             del cache_x
-        x = F.pad(x, padding)
+        if padding[4] != 0:
+            x = F.pad(x, padding)
 
         return super().forward(x)
 
