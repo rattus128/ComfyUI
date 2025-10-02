@@ -255,7 +255,12 @@ class WanAttentionBlock(nn.Module):
 
         # cross-attention & ffn
         x = x + self.cross_attn(self.norm3(x), context, context_img_len=context_img_len, transformer_options=transformer_options)
-        y = self.ffn(torch.addcmul(repeat_e(e[3], x), self.norm2(x), 1 + repeat_e(e[4], x)))
+        y = torch.cat([self.ffn(chunk) for chunk in list(torch.chunk(torch.addcmul(repeat_e(e[3], x),
+                                                                                   self.norm2(x), 1 + repeat_e(e[4],
+                                                                                   x)),
+                                                                     chunks = max(2 * self.ffn_dim // self.dim, 1),
+                                                                     dim=1))],
+                      dim=1)
         x = torch.addcmul(x, y, repeat_e(e[5], x))
         return x
 
