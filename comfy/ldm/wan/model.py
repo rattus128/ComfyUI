@@ -64,19 +64,24 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        def qkv_fn_q(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            return apply_rope1(q, freqs)
+        def qkv_fn_q(x, f):
+            q = self.norm_q(self.q(x)).view(b, x.shape[1], n, d)
+            return apply_rope1(q, f)
 
-        def qkv_fn_k(x):
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            return apply_rope1(k, freqs)
+        def qkv_fn_k(x, f):
+            k = self.norm_k(self.k(x)).view(b, x.shape[1], n, d)
+            return apply_rope1(k, f)
 
-        #These two are VRAM hogs, so we want to do all of q computation and
-        #have pytorch garbage collect the intermediates on the sub function
-        #return before we touch k
-        q = qkv_fn_q(x)
-        k = qkv_fn_k(x)
+        q = torch.empty(b, s, n, d, dtype=x.dtype, device=x.device)
+        k = torch.empty(b, s, n, d, dtype=x.dtype, device=x.device)
+        xc = torch.chunk(x, chunks=4, dim=1)
+        fc = torch.chunk(freqs, chunks=4, dim=1)
+        l  = 0
+        for i, (x1, f1) in enumerate(zip(xc, fc)):
+            l1 = x1.shape[1]
+            q[:, l: l + l1,:, :] = qkv_fn_q(x1, f1)
+            k[:, l: l + l1,:, :] = qkv_fn_k(x1, f1)
+            l += l1
 
         x = optimized_attention(
             q.view(b, s, n * d),
@@ -98,8 +103,17 @@ class WanT2VCrossAttention(WanSelfAttention):
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
         """
+
         # compute query, key, value
-        q = self.norm_q(self.q(x))
+
+        q = torch.empty_like(x)
+        xc = torch.chunk(x, chunks=4, dim=1)
+        l  = 0
+        for i, x1 in enumerate(xc):
+            l1 = x1.shape[1]
+            q[:, l: l + l1,:] = self.norm_q(self.q(x1))
+            l += l1
+
         k = self.norm_k(self.k(context))
         v = self.v(context)
 
