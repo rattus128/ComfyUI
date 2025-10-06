@@ -82,11 +82,14 @@ class WanSelfAttention(nn.Module):
             q[:, l: l + l1,:, :] = qkv_fn_q(x1, f1)
             k[:, l: l + l1,:, :] = qkv_fn_k(x1, f1)
             l += l1
+        v = self.v(x)
+        del x
+        del xc
 
         x = optimized_attention(
             q.view(b, s, n * d),
             k.view(b, s, n * d),
-            self.v(x).view(b, s, n * d),
+            v.view(b, s, n * d),
             heads=self.num_heads,
             transformer_options=transformer_options,
         )
