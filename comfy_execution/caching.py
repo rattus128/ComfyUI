@@ -1,4 +1,6 @@
+import bisect
 import itertools
+import torch
 from typing import Sequence, Mapping, Dict
 from comfy_execution.graph import DynamicPrompt
 from abc import ABC, abstractmethod
@@ -336,3 +338,69 @@ class LRUCache(BasicCache):
             self._mark_used(child_id)
             self.children[cache_key].append(self.cache_key_set.get_data_key(child_id))
         return self
+
+import gc
+import psutil
+
+def _ram_gb():
+    return psutil.virtual_memory().available / (1024**3)
+
+#Iterating the cache for usage analysis might be expensive, so if we trigger make sure
+#we take a chunk out to give breathing space on high-node / low-ram-per-node flows.
+
+RAM_CACHE_HYSTERESIS = 1.1
+
+class RAMPressureCache(LRUCache):
+
+    def __init__(self, key_class):
+        super().__init__(key_class, 0)
+        self.node_ids = {} #Debug - remove
+
+    def clean_unused(self):
+        self._clean_subcaches()
+
+    def set(self, node_id, value): #Debug - remove
+        super().set(node_id, value)
+        self.node_ids[self.cache_key_set.get_data_key(node_id)] = node_id
+
+    def notify_ram_usage(self, min_headroom):
+        if _ram_gb() > min_headroom:
+            return
+        gc.collect()
+        if _ram_gb() > min_headroom:
+            return
+
+        print(f"RUNNING RAM CLEANUP")
+
+        clean_list = []
+
+        for key, (outputs, _), in self.cache.items():
+            #Exponential bias towards evicting older workflows so garbage will be taken out
+            #in constantly changing setups.
+            oom_score =  1.3 ** (self.generation - self.used_generation[key])
+
+            #default assumption.
+            ram_usage = 0.1
+            def scan_list_for_ram_usage(outputs):
+                nonlocal ram_usage
+                for output in outputs:
+                    if isinstance(output, list):
+                        scan_list_for_ram_usage(output)
+                    elif isinstance(output, torch.Tensor):
+                        #score Tensors at a 50% discount for RAM usage as they are likely to
+                        #be high value intermediates
+                        ram_usage += (output.numel() * output.element_size()) * 0.5
+                        print(f"NODE {self.node_ids[key]} has tensor so ram {ram_usage}")
+                    elif hasattr(output, "get_ram_usage"):
+                        ram_usage += output.get_ram_usage()
+                        print(f"NODE {self.node_ids[key]} has GRU {ram_usage}")
+            scan_list_for_ram_usage(outputs)
+
+            oom_score *= ram_usage
+            bisect.insort(clean_list, (oom_score, key))
+
+        while _ram_gb() < min_headroom * RAM_CACHE_HYSTERESIS and clean_list:
+            _, key = clean_list.pop()
+            print(f"EVICTING {self.node_ids[key]} @ {_ram_gb()} occ")
+            del self.cache[key]
+            gc.collect()
