@@ -56,7 +56,9 @@ class WanSelfAttention(nn.Module):
         self.norm_q = operation_settings.get("operations").RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
         self.norm_k = operation_settings.get("operations").RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
 
-    def forward(self, x, freqs, transformer_options={}):
+    def qkv(self, xl, freqs):
+        x = xl[0]
+        xl.clear()
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -74,8 +76,8 @@ class WanSelfAttention(nn.Module):
 
         q = torch.empty(b, s, n, d, dtype=x.dtype, device=x.device)
         k = torch.empty(b, s, n, d, dtype=x.dtype, device=x.device)
-        xc = torch.chunk(x, chunks=4, dim=1)
-        fc = torch.chunk(freqs, chunks=4, dim=1)
+        xc = torch.chunk(x, chunks=6, dim=1)
+        fc = torch.chunk(freqs, chunks=6, dim=1)
         l  = 0
         for i, (x1, f1) in enumerate(zip(xc, fc)):
             l1 = x1.shape[1]
@@ -83,10 +85,13 @@ class WanSelfAttention(nn.Module):
             k[:, l: l + l1,:, :] = qkv_fn_k(x1, f1)
             l += l1
         v = self.v(x)
-        del x
-        del xc
+        return q, k, v
 
-        x = optimized_attention(
+    def do_attention(self, xl, freqs, transformer_options={}):
+        q, k, v = self.qkv(xl, freqs)
+        b, s, n, d = *v.shape[:2], self.num_heads, self.head_dim
+
+        return optimized_attention(
             q.view(b, s, n * d),
             k.view(b, s, n * d),
             v.view(b, s, n * d),
@@ -94,8 +99,9 @@ class WanSelfAttention(nn.Module):
             transformer_options=transformer_options,
         )
 
-        x = self.o(x)
-        return x
+    def forward(self, xl, freqs, transformer_options={}):
+        x = self.do_attention(xl, freqs, transformer_options=transformer_options)
+        return self.o(x)
 
 
 class WanT2VCrossAttention(WanSelfAttention):
@@ -200,6 +206,7 @@ class WanAttentionBlock(nn.Module):
         self.dim = dim
         self.ffn_dim = ffn_dim
         self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
@@ -248,23 +255,24 @@ class WanAttentionBlock(nn.Module):
             e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device).unsqueeze(0) + e).unbind(2)
         # assert e[0].dtype == torch.float32
 
-        # self-attention
-        y = self.self_attn(
-            torch.addcmul(repeat_e(e[0], x), self.norm1(x), 1 + repeat_e(e[1], x)),
-            freqs, transformer_options=transformer_options)
+        y = torch.addcmul(repeat_e(e[0], x), self.norm1(x), 1 + repeat_e(e[1], x))
+        y = [ y ]
 
-        x = torch.addcmul(x, y, repeat_e(e[2], x))
+        # self-attention
+        y = self.self_attn(y, freqs, transformer_options=transformer_options)
+
+        x.addcmul_(y, repeat_e(e[2], x))
         del y
 
         # cross-attention & ffn
-        x = x + self.cross_attn(self.norm3(x), context, context_img_len=context_img_len, transformer_options=transformer_options)
+        x.add_(self.cross_attn(self.norm3(x), context, context_img_len=context_img_len, transformer_options=transformer_options))
         y = torch.cat([self.ffn(chunk) for chunk in list(torch.chunk(torch.addcmul(repeat_e(e[3], x),
                                                                                    self.norm2(x), 1 + repeat_e(e[4],
                                                                                    x)),
                                                                      chunks = max(2 * self.ffn_dim // self.dim, 1),
                                                                      dim=1))],
                       dim=1)
-        x = torch.addcmul(x, y, repeat_e(e[5], x))
+        x.addcmul_(y, repeat_e(e[5], x))
         return x
 
 
