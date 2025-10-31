@@ -753,7 +753,7 @@ class ModelPatcher:
                     self.unpin_weight(key)
                     self.patch_weight_to_device(key, device_to=device_to)
 
-                logging.debug("lowvram: loaded module regularly {} {}".format(n, m))
+                logging.debug("lowvram: loaded module regularly {} {} {}".format(n, m, x[0]))
                 m.comfy_patched_weights = True
 
             for x in load_completely:

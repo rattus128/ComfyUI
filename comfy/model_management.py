@@ -1039,7 +1039,9 @@ def get_offload_stream(device):
     elif is_device_cuda(device):
         ss = []
         for k in range(NUM_STREAMS):
-            ss.append(torch.cuda.Stream(device=device, priority=0))
+            s = torch.cuda.Stream(device=device, priority=0)
+            s.garbage = []
+            ss.append(s)
         STREAMS[device] = ss
         s = ss[stream_counter]
         stream_counters[device] = stream_counter
@@ -1047,7 +1049,9 @@ def get_offload_stream(device):
     elif is_device_xpu(device):
         ss = []
         for k in range(NUM_STREAMS):
-            ss.append(torch.xpu.Stream(device=device, priority=0))
+            s = torch.xpu.Stream(device=device, priority=0)
+            s.garbage = []
+            ss.append(s)
         STREAMS[device] = ss
         s = ss[stream_counter]
         stream_counters[device] = stream_counter

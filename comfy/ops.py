@@ -84,7 +84,13 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
         if device is None:
             device = input.device
 
-    if offloadable:
+    bias_has_function = len(s.bias_function) > 0
+    weight_has_function = len(s.weight_function) > 0
+
+    if offloadable and (
+            s.weight.device != device or (s.bias is not None and s.bias.device != device) or
+            bias_has_function or weight_has_function or
+            (s.bias is not None and s.bias.dtype != bias_dtype) or s.weight.dtype !=dtype):
         offload_stream = comfy.model_management.get_offload_stream(device)
     else:
         offload_stream = None
@@ -97,25 +103,27 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     bias = None
     non_blocking = comfy.model_management.device_supports_non_blocking(device)
 
-    bias_has_function = len(s.bias_function) > 0
-    weight_has_function = len(s.weight_function) > 0
-
-    weight = comfy.model_management.cast_to(s.weight, dtype, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+    weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 
     if s.bias is not None:
-        bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
-
-    if weight_has_function:
-        with wf_context:
-            for f in s.weight_function:
-                weight = f(weight)
-
-    if s.bias is not None and bias_has_function:
-        with wf_context:
-            for f in s.bias_function:
-                bias = f(bias)
+        bias = comfy.model_management.cast_to(s.bias, None, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
 
     comfy.model_management.sync_stream(device, offload_stream)
+
+    if weight_has_function:
+        weight=weight.to(dtype=dtype)
+        for f in s.weight_function:
+            weight = f(weight)
+
+    if s.bias is not None and bias_has_function:
+        bias=bias.to(dtype=bias_dtype)
+        for f in s.bias_function:
+            bias = f(bias)
+
+    weight=weight.to(dtype=dtype)
+    if bias is not None:
+        bias=bias.to(dtype=bias_dtype)
+
     if offloadable:
         return weight, bias, offload_stream
     else:
@@ -126,13 +134,19 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
 def uncast_bias_weight(s, weight, bias, offload_stream):
     if offload_stream is None:
         return
+
     if weight is not None:
         device = weight.device
     else:
         if bias is None:
             return
         device = bias.device
-    offload_stream.wait_stream(comfy.model_management.current_stream(device))
+
+    if len(offload_stream.garbage) > 5:
+        offload_stream.wait_stream(comfy.model_management.current_stream(device))
+        offload_stream.garbage.clear()
+
+    offload_stream.garbage.append((weight, bias))
 
 
 class CastWeightBiasOp:

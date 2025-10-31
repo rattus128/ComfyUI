@@ -15,6 +15,8 @@ from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
 from comfy_api import feature_flags
 
+import logging
+
 if __name__ == "__main__":
     #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
@@ -371,6 +373,8 @@ if __name__ == "__main__":
 
     event_loop, _, start_all_func = start_comfyui()
     try:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger().setLevel(logging.INFO)
         x = start_all_func()
         app.logger.print_startup_warnings()
         event_loop.run_until_complete(x)
