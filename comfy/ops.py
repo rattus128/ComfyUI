@@ -86,13 +86,11 @@ def cast_prefetch_all(module, device):
                     if offload_stream is None:
                         return None
                 m.weight_prefetch = comfy.model_management.cast_to(m.weight, None, device, non_blocking=True, copy=True, stream=offload_stream)
-                print(f"prefetching {n}.weight")
             if m.bias is not None and m.bias.device != device and not hasattr(m, "bias_prefetch"):
                 if offload_stream is None:
                     offload_stream = comfy.model_management.get_offload_stream(device)
                     if offload_stream is None:
                         return None
-                print(f"prefetching {n}.bias")
                 m.bias_prefetch = comfy.model_management.cast_to(m.bias, None, device, non_blocking=True, copy = True, stream=offload_stream)
 
     return offload_stream
@@ -212,19 +210,13 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
 def uncast_bias_weight(s, weight, bias, offload_stream):
     if offload_stream is None:
         return
-
     if weight is not None:
         device = weight.device
     else:
         if bias is None:
             return
         device = bias.device
-
-    if len(offload_stream.garbage) > 5:
-        offload_stream.wait_stream(comfy.model_management.current_stream(device))
-        offload_stream.garbage.clear()
-
-    offload_stream.garbage.append((weight, bias))
+    offload_stream.wait_stream(comfy.model_management.current_stream(device))
 
 
 class CastWeightBiasOp:
