@@ -238,7 +238,7 @@ class ModelPatcher:
         self.force_cast_weights = False
         self.patches_uuid = uuid.uuid4()
         self.parent = None
-        self.pinned = set()
+        self.pinned = {}
 
         self.attachments: dict[str] = {}
         self.additional_models: dict[str, list[ModelPatcher]] = {}
@@ -638,14 +638,41 @@ class ModelPatcher:
 
     def pin_weight_to_device(self, key):
         weight, set_func, convert_func = get_key_weight(self.model, key)
-        if comfy.model_management.pin_memory(weight):
-            self.pinned.add(key)
+        weight_size = weight.numel() * weight.element_size()
+        weight_ptr = weight.data_ptr()
+
+        if not comfy.model_management.is_device_cpu(weight.device):
+            return
+
+        if key in self.pinned:
+            _, pinned_ptr, pinned_size = self.pinned[key]
+            if weight_size == pinned_size and weight_ptr == pinned_ptr:
+                #re-pin fast path, just update tensor ref and go home
+                self.pinned[key] = weight, weight_ptr, weight_size
+                return
+            comfy.model_management.unpin_memory(pinned_ptr, pinned_size)
+
+        if comfy.model_management.pin_memory(weight_ptr, weight_size):
+            self.pinned[key] = weight, weight_ptr, weight_size
 
     def unpin_weight(self, key):
+        weight, set_func, convert_func = get_key_weight(self.model, key)
+        weight_size = weight.numel() * weight.element_size()
+        weight_ptr = weight.data_ptr()
+
         if key in self.pinned:
-            weight, set_func, convert_func = get_key_weight(self.model, key)
-            comfy.model_management.unpin_memory(weight)
-            self.pinned.remove(key)
+            _, pinned_ptr, pinned_size = self.pinned[key]
+
+            if not comfy.model_management.is_device_cpu(weight.device):
+                logging.warning(f"Weight moved off CPU after pinning: {key}")
+            if weight_size != pinned_size:
+                logging.warning(f"Weight size changed after pinning: {key}")
+            if weight_ptr != pinned_ptr:
+                logging.warning(f"Weight ptr changed after pinning: {key}")
+
+            if not comfy.model_management.unpin_memory(pinned_ptr, pinned_size):
+                logging.warning(f"Unpinning failed, expect major instability: {key}")
+            del self.pinned[key]
 
     def unpin_all_weights(self):
         for key in list(self.pinned):
