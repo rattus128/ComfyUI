@@ -721,9 +721,8 @@ class LoadLora:
         from comfy_execution.graph_utils import GraphBuilder
         g = GraphBuilder()
         # create the nodes
-        load_weights = g.node("LoadLoraWeights", lora_name=lora_name)
-        apply_weights = g.node("ApplyLoraWeights", model=model, clip=clip, lora=load_weights.out(0), strength_model=strength_model, strength_clip=strength_clip)
-
+        load_weights = g.node("LoraLoadWeights", lora_name=lora_name)
+        apply_weights = g.node("LoraApplyWeights", model=model, clip=clip, lora=load_weights.out(0), strength_model=strength_model, strength_clip=strength_clip)
         return {
             "result": (apply_weights.out(0), apply_weights.out(1)),
             "expand": g.finalize(),
@@ -739,18 +738,8 @@ class LoadLoraModelOnly(LoadLora):
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_lora_model_only"
     def load_lora_model_only(self, model, lora_name, strength_model):
-        if strength_model == 0:
-            return (model,)
+        return self.load_lora(model, None,lora_name, strength_model, 0)
 
-        from comfy_execution.graph_utils import GraphBuilder
-        g = GraphBuilder()
-        load_weights = g.node("LoadLoraWeights", lora_name=lora_name)
-        apply_weights = g.node("ApplyLoraWeights", model=model, clip=None, lora=load_weights.out(0), strength_model=strength_model, strength_clip=0)
-
-        return {
-            "result": (apply_weights.out(0),),
-            "expand": g.finalize(),
-        }
 
 class LoadLoraWeights:
     @classmethod
@@ -766,7 +755,7 @@ class LoadLoraWeights:
         lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
         return (lora,)
 
-class ApplyLoraWeights:
+class LoraApplyWeights:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "model": ("MODEL",),
@@ -783,7 +772,7 @@ class ApplyLoraWeights:
         model_lora, clip_lora = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
         return (model_lora, clip_lora)
 
-class ApplyLoraWeightsModelOnly(ApplyLoraWeights):
+class LoraApplyWeightsModelOnly(LoraApplyWeights):
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "model": ("MODEL",),
@@ -2103,7 +2092,6 @@ NODE_CLASS_MAPPINGS = {
     "LatentRotate": LatentRotate,
     "LatentFlip": LatentFlip,
     "LatentCrop": LatentCrop,
-    "LoraLoader": LoraLoader,
     "CLIPLoader": CLIPLoader,
     "UNETLoader": UNETLoader,
     "DualCLIPLoader": DualCLIPLoader,
@@ -2131,13 +2119,12 @@ NODE_CLASS_MAPPINGS = {
 
     "ConditioningZeroOut": ConditioningZeroOut,
     "ConditioningSetTimestepRange": ConditioningSetTimestepRange,
-    "LoraLoaderModelOnly": LoraLoaderModelOnly,
 
-    "LoadLora": LoadLora,
-    "LoadLoraModelOnly": LoadLoraModelOnly,
-    "LoadLoraWeights": LoadLoraWeights,
-    "ApplyLoraWeights": ApplyLoraWeights,
-    "ApplyLoraWeightsModelOnly": ApplyLoraWeightsModelOnly,
+    "LoraLoader": LoraLoader,
+    "LoraLoaderModelOnly": LoraLoaderModelOnly,
+    "LoraLoadWeights": LoraLoadWeights,
+    "LoraApplyWeights": LoraApplyWeights,
+    "LoraApplyWeightsModelOnly": LoraApplyWeightsModelOnly,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
