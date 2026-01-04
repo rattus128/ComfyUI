@@ -611,8 +611,8 @@ class ModelPatcher:
                         sd.pop(k)
             return sd
 
-    def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
-        if key not in self.patches:
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False, do_weight_wrappers=False):
+        if key not in self.patches and not (do_weight_wrappers and key in self.weight_wrapper_patches):
             return
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
@@ -629,7 +629,14 @@ class ModelPatcher:
         if convert_func is not None:
             temp_weight = convert_func(temp_weight, inplace=True)
 
-        out_weight = comfy.lora.calculate_weight(self.patches[key], temp_weight, key)
+        patches = self.patches.get(key, None)
+
+        out_weight = temp_weight
+        if patches is not None:
+            out_weight = comfy.lora.calculate_weight(patches, out_weight, key)
+        if do_weight_wrappers:
+            for wrapper in self.weight_wrapper_patches.get(key, []):
+                out_weight = wrapper(out_weight)
         if set_func is None:
             out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
             if inplace_update:
@@ -725,14 +732,14 @@ class ModelPatcher:
 
                     if weight_key in self.patches:
                         if force_patch_weights:
-                            self.patch_weight_to_device(weight_key)
+                            self.patch_weight_to_device(weight_key, do_weight_wrappers=True)
                         else:
                             _, set_func, convert_func = get_key_weight(self.model, weight_key)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     if bias_key in self.patches:
                         if force_patch_weights:
-                            self.patch_weight_to_device(bias_key)
+                            self.patch_weight_to_device(bias_key, do_weight_wrappers=True)
                         else:
                             _, set_func, convert_func = get_key_weight(self.model, bias_key)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
@@ -774,7 +781,7 @@ class ModelPatcher:
                 for param in params:
                     key = "{}.{}".format(n, param)
                     self.unpin_weight(key)
-                    self.patch_weight_to_device(key, device_to=device_to)
+                    self.patch_weight_to_device(key, device_to=device_to, do_weight_wrappers=force_patch_weights)
                 if comfy.model_management.is_device_cuda(device_to):
                     torch.cuda.synchronize()
 
