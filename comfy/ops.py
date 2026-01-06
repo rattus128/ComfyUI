@@ -566,6 +566,9 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     self.layout_type = qconfig["comfy_tensor_layout"]
                     layout_cls = get_layout_class(self.layout_type)
 
+                    if layout_cls is None:
+                        raise RuntimeError(f"Layout type {self.layout_type} not found. Please check you have comfy-kitchen installed. (pip install comfy-kitchen)")
+
                     # Load format-specific parameters
                     if self.quant_format in ["float8_e4m3fn", "float8_e5m2"]:
                         # FP8: single tensor scale
