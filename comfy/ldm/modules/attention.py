@@ -238,6 +238,8 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
     batch_x_heads, q_tokens, _ = query.shape
     _, _, k_tokens = key.shape
 
+    #FIXME: put a floor on this in ModelPatcherDynamic to let this take priority
+    #over loading weights. 
     mem_free_total, _ = model_management.get_free_memory(query.device, True)
 
     kv_chunk_size_min = None
@@ -309,6 +311,8 @@ def attention_split(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 
     r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
 
+    #FIXME: put a floor on this in ModelPatcherDynamic to let this take priority
+    #over loading weights. 
     mem_free_total = model_management.get_free_memory(q.device)
 
     if attn_precision == torch.float32:

@@ -85,6 +85,16 @@ if not args.cuda_malloc:
     except:
         pass
 
+def args_enables_dynamic_vram():
+    return PerformanceFeature.DynamicVRAM in args.fast and not args.highvram and not args.gpu_only
+
+if args_enables_dynamic_vram():
+    try:
+        import aimdo.control #This tests aimdo exists without torch import
+        args.cuda_malloc = False
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ""
+    except:
+        pass
 
 if args.disable_cuda_malloc:
     args.cuda_malloc = False

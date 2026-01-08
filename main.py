@@ -15,7 +15,6 @@ from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
 from comfy_api import feature_flags
 
-
 if __name__ == "__main__":
     #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
@@ -172,6 +171,35 @@ import gc
 if 'torch' in sys.modules:
     logging.warning("WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.")
 
+import comfy.memory_management
+import comfy.model_patcher #weird to be first
+
+has_aimdo = False
+
+try:
+    import aimdo.control
+    if args.verbose == 'DEBUG':
+        aimdo.control.set_log_debug()
+    elif args.verbose == 'CRITICAL':
+        aimdo.control.set_log_critical()
+    elif args.verbose == 'ERROR':
+        aimdo.control.set_log_error()
+    elif args.verbose == 'WARNING':
+        aimdo.control.set_log_warning()
+    else: #INFO
+        aimdo.control.set_log_info()
+
+    #TODO Remove:
+    aimdo.control.set_log_debug()
+
+    if cuda_malloc.args_enables_dynamic_vram():
+        comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+        logging.info("DynamicVRAM support detected and enabled")
+        has_aimdo = True
+except:
+    if cuda_malloc.args_enables_dynamic_vram():
+        logging.info("No aimdo install detected. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows+Nvidia")
+
 import comfy.utils
 
 import execution
@@ -182,6 +210,11 @@ import comfy.model_management
 import comfyui_version
 import app.logger
 import hook_breaker_ac10a0
+
+if has_aimdo:
+    aimdo.control.init_vram_guard(comfy.model_management.get_torch_device().index)
+else:
+    comfy.memory_management.aimdo_allocator = None
 
 def cuda_malloc_warning():
     device = comfy.model_management.get_torch_device()

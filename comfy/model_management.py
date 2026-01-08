@@ -28,7 +28,13 @@ import weakref
 import gc
 import os
 from contextlib import nullcontext
+import comfy.utils
 import comfy.quant_ops
+
+try:
+    import aimdo.model_vbar
+except:
+    pass
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -583,7 +589,7 @@ def extra_reserved_memory():
 def minimum_inference_memory():
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
-def free_memory(memory_required, device, keep_loaded=[]):
+def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False):
     cleanup_models_gc()
     unloaded_model = []
     can_unload = []
@@ -601,8 +607,13 @@ def free_memory(memory_required, device, keep_loaded=[]):
         memory_to_free = None
         if not DISABLE_SMART_MEMORY:
             free_mem = get_free_memory(device)
-            if free_mem > memory_required:
+            if free_mem >= memory_required:
                 break
+            if current_loaded_models[i].model.is_dynamic() and for_dynamic:
+                #don't actually unload dynamic models for the sake of other dynamic models
+                #as that works on-demand.
+                memory_required -= current_loaded_models[i].model.loaded_size()
+                continue
             memory_to_free = memory_required - free_mem
         logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
         if current_loaded_models[i].model_unload(memory_to_free):
@@ -641,7 +652,10 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
     models_to_load = []
 
+    free_for_dynamic=True
     for x in models:
+        if not x.is_dynamic:
+            free_for_dynamic = False
         loaded_model = LoadedModel(x)
         try:
             loaded_model_index = current_loaded_models.index(loaded_model)
@@ -667,19 +681,20 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             model_to_unload.model.detach(unpatch_all=False)
             model_to_unload.model_finalizer.detach()
 
+
     total_memory_required = {}
     for loaded_model in models_to_load:
         total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.model_memory_required(loaded_model.device)
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.1 + extra_mem, device)
+            free_memory(total_memory_required[device] * 1.1 + extra_mem, device, for_dynamic=free_for_dynamic)
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
             free_mem = get_free_memory(device)
             if free_mem < minimum_memory_required:
-                models_l = free_memory(minimum_memory_required, device)
+                models_l = free_memory(minimum_memory_required, device, for_dynamic=free_for_dynamic)
                 logging.info("{} models unloaded.".format(len(models_l)))
 
     for loaded_model in models_to_load:
@@ -1130,7 +1145,59 @@ def sync_stream(device, stream):
         return
     current_stream(device).wait_stream(stream)
 
+
+def cast_to_gathered(tensors, r, non_blocking=False, stream=None):
+    wf_context = nullcontext()
+    if stream is not None:
+       wf_context = stream
+       if hasattr(wf_context, "as_context"):
+           wf_context = wf_context.as_context(stream)
+
+    dest_views = comfy.memory_management.interpret_gathered_like(tensors, r)
+    with wf_context:
+        for tensor in tensors:
+            dest_view = dest_views.pop(0)
+            if tensor is None:
+                continue
+            dest_view.copy_(tensor, non_blocking=non_blocking)
+
+
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None, r=None):
+    if hasattr(weight, "_v"):
+        #Unexpected usage patterns. There is no reason these don't work but they
+        #have no testing and no callers do this.
+        assert r is None
+        assert stream is None
+
+        r = torch.empty_like(weight, dtype=dtype, device=device)
+
+        signature = aimdo.model_vbar.vbar_fault(weight._v)
+        if signature is not None:
+            raw_tensor = comfy.memory_management.aimdo_to_tensor(weight._v, device)
+            v_tensor = comfy.memory_management.interpret_gathered_like([weight], raw_tensor)[0]
+
+        if aimdo.model_vbar.vbar_signature_compare(signature, weight._v_signature):
+            #always take a deep copy even if _v is good, as we have no reasonable point to unpin
+            #a non comfy weight
+            r.copy_(v_tensor)
+            aimdo.model_vbar.vbar_unpin(weight._v)
+            return r
+
+        r.copy_(weight, non_blocking=non_blocking)
+
+        #FIXME: remove hooks before PR
+        if hasattr(weight, "comfy_hook"):
+            dtype = r.dtype
+            r = weight.comfy_hook(r)
+            if r.dtype != dtype:
+                r = comfy.float.stochastic_rounding(r, dtype, seed=comfy.utils.string_to_seed(weight.seed_key))
+
+        if signature is not None:
+            v_tensor.copy_(r)
+            aimdo.model_vbar.vbar_unpin(weight._v)
+
+        return r
+
     if device is None or weight.device == device:
         if not copy:
             if dtype is None or weight.dtype == dtype:
