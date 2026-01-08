@@ -244,6 +244,8 @@ def slice_attention(q, k, v):
     r1 = torch.zeros_like(k, device=q.device)
     scale = (int(q.shape[-1])**(-0.5))
 
+    #FIXME: put a floor on this in ModelPatcherDynamic to let this take priority
+    #over loading weights. 
     mem_free_total = model_management.get_free_memory(q.device)
 
     tensor_size = q.shape[0] * q.shape[1] * k.shape[2] * q.element_size()

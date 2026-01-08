@@ -260,6 +260,8 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
             to_batch_temp.reverse()
             to_batch = to_batch_temp[:1]
 
+            #FIXME: The VBAR needs to be queried and the full absent volume of the current
+            #model deducted and all low priority RAM should be added
             free_memory = model_management.get_free_memory(x_in.device)
             for i in range(1, len(to_batch_temp) + 1):
                 batch_amount = to_batch_temp[:len(to_batch_temp)//i]
