@@ -26,10 +26,7 @@ import json
 import comfy.memory_management
 import comfy.utils
 
-try:
-    import aimdo.model_vbar
-except:
-    pass
+import comfy_aimdo.model_vbar
 
 def run_every_op():
     if torch.compiler.is_compiling():
@@ -79,23 +76,23 @@ def cast_to_input(weight, input, non_blocking=False, copy=True):
     return comfy.model_management.cast_to(weight, input.dtype, input.device, non_blocking=non_blocking, copy=copy)
 
 
-def cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking):
+def cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking, compute_dtype):
     offload_stream = None
     xfer_dest = None
 
-    signature = aimdo.model_vbar.vbar_fault(s._v)
+    signature = comfy_aimdo.model_vbar.vbar_fault(s._v)
     if signature is not None:
         xfer_dest = comfy.memory_management.aimdo_to_tensor(s._v, device)
-    resident = aimdo.model_vbar.vbar_signature_compare(signature, s._v_signature)
+    resident = comfy_aimdo.model_vbar.vbar_signature_compare(signature, s._v_signature)
 
     if not resident:
 
-        #FIXME: rethink pinning completely
-        if signature is None:
-            comfy.memory_management.pin_memory(s)
+        xfer_source = [ s.weight, s.bias ]
 
         pin = comfy.memory_management.get_pin(s)
-        xfer_source = [ s.weight, s.bias ] if pin is None else [ pin ]
+        if pin is not None:
+            xfer_source = [ pin ]
+            resident = True #If pinned data exists, it always has LowVram already applied
 
         dest_size = comfy.memory_management.vram_aligned_size(xfer_source)
         offload_stream = comfy.model_management.get_offload_stream(device)
@@ -112,16 +109,22 @@ def cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking):
         comfy.model_management.cast_to_gathered(xfer_source, xfer_dest, non_blocking=non_blocking, stream=offload_stream)
         comfy.model_management.sync_stream(device, offload_stream)
 
+    pin = None
     if signature is not None:
         #If we are able to increase our load level (e.g. user reduces resolution or batch number)
         #reclaim the pin previously used for offload.
         comfy.memory_management.unpin_memory(s)
+    elif not resident:
+        #prepare a new pin
+        assert comfy.memory_management.get_pin(s) is None
+        comfy.memory_management.pin_memory(s)
+        pin = comfy.memory_management.get_pin(s)
 
     params = comfy.memory_management.interpret_gathered_like([s.weight, s.bias], xfer_dest)
     weight = params[0]
     bias = params[1]
 
-    def post_cast(s, param_key, x, dtype, resident, alloc):
+    def post_cast(s, param_key, x, dtype, resident, update_weight):
         lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
         hook_fn = getattr(s, param_key + "_hooks", None)
         fns = getattr(s, param_key + "_function", [])
@@ -137,39 +140,44 @@ def cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking):
 
         if orig.dtype != dtype or len(fns) > 0:
             x = to_dequant(x, dtype)
-        if not resident:
-            if lowvram_fn is not None or hook_fn is not None:
-                x = to_dequant(x, dtype)
-            if lowvram_fn is not None:
-                x = lowvram_fn(x)
-            if hook_fn is not None:
-                x = hook_fn(x)
-            if alloc and (lowvram_fn is not None or hook_fn is not None):
-                if isinstance(orig, QuantizedTensor):
-                    seed = comfy.utils.string_to_seed(s.seed_key)
-                    orig.copy_(QuantizedTensor.from_float(x, s.layout_type, scale="recalculate", stochastic_rounding=seed))
-                    if orig.dtype == dtype and len(fns) == 0:
-                        #The layer actually wants our freshly saved QT (and no more fns in the way)
-                        x = orig
-                elif orig.dtype != dtype:
-                    seed = comfy.utils.string_to_seed(s.seed_key)
-                    orig.copy_(comfy.float.stochastic_rounding(x, orig_dtype, seed=seed))
-                else:
-                    orig.copy_(x)
+        if not resident and lowvram_fn is not None:
+            x = to_dequant(x, dtype if compute_dtype is None else compute_dtype)
+            #FIXME: this is not accurate, we need to be sensitive to the compute dtype
+            x = lowvram_fn(x)
+            if (isinstance(orig, QuantizedTensor) and
+                (orig.dtype == dtype and len(fns) == 0 or update_weight)):
+                seed = comfy.utils.string_to_seed(s.seed_key)
+                y = QuantizedTensor.from_float(x, s.layout_type, scale="recalculate", stochastic_rounding=seed)
+                if orig.dtype == dtype and len(fns) == 0:
+                    #The layer actually wants our freshly saved QT
+                    x = y
+            else:
+                y = x
+            if update_weight:
+                orig.copy_(y)
         for f in fns:
             x = f(x)
         return x
 
-    weight = post_cast(s, "weight", weight, dtype, resident, signature is not None)
+    update_weight = signature is not None or pin is not None
+
+    weight = post_cast(s, "weight", weight, dtype, resident, update_weight)
     if s.bias is not None:
-        bias = post_cast(s, "bias", bias, bias_dtype, resident, signature is not None)
+        bias = post_cast(s, "bias", bias, bias_dtype, resident, update_weight)
     s._v_signature=signature
+
+    if pin is not None:
+        xfer_dest = comfy.memory_management.interpret_gathered_like([ pin ], xfer_dest)[0]
+        if offload_stream is not None:
+            #FIXME: if post cast didnt do anything this sync is un-needed
+            offload_stream.wait_stream(comfy.model_management.current_stream(device))
+        comfy.model_management.cast_to(xfer_dest, device=pin.device, non_blocking=non_blocking, stream=offload_stream, r=pin)
 
     #FIXME: weird offload return protocol
     return weight, bias, (offload_stream, device if signature is not None else None, None)
 
 
-def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, offloadable=False):
+def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, offloadable=False, compute_dtype=None):
     # NOTE: offloadable=False is a a legacy and if you are a custom node author reading this please pass
     # offloadable=True and call uncast_bias_weight() after your last usage of the weight/bias. This
     # will add async-offload support to your cast and improve performance.
@@ -187,7 +195,7 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     non_blocking = comfy.model_management.device_supports_non_blocking(device)
 
     if hasattr(s, "_v"):
-        return cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking)
+        return cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking, compute_dtype)
 
     if offloadable and (device != s.weight.device or
                         (s.bias is not None and device != s.bias.device)):
@@ -248,7 +256,7 @@ def uncast_bias_weight(s, weight, bias, offload_stream):
     device=None
     #FIXME: This is not good RTTI
     if not isinstance(weight_a, torch.Tensor):
-        aimdo.model_vbar.vbar_unpin(s._v)
+        comfy_aimdo.model_vbar.vbar_unpin(s._v)
         device = weight_a
     if os is None:
         return
@@ -764,8 +772,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
             def _forward(self, input, weight, bias):
                 return torch.nn.functional.linear(input, weight, bias)
 
-            def forward_comfy_cast_weights(self, input):
-                weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True)
+            def forward_comfy_cast_weights(self, input, compute_dtype=None):
+                weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True, compute_dtype=compute_dtype)
                 x = self._forward(input, weight, bias)
                 uncast_bias_weight(self, weight, bias, offload_stream)
                 return x
@@ -775,6 +783,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
 
                 input_shape = input.shape
                 reshaped_3d = False
+                #If cast needs to apply lora, it should be done in the compute dtype
+                compute_dtype = input.dtype
 
                 if (getattr(self, 'layout_type', None) is not None and
                     not isinstance(input, QuantizedTensor) and not self._full_precision_mm and
@@ -793,7 +803,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                             scale = comfy.model_management.cast_to_device(scale, input.device, None)
                         input = QuantizedTensor.from_float(input_reshaped, self.layout_type, scale=scale)
 
-                output = self.forward_comfy_cast_weights(input)
+
+                output = self.forward_comfy_cast_weights(input, compute_dtype)
 
                 # Reshape output back to 3D if input was 3D
                 if reshaped_3d:

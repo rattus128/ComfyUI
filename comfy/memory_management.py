@@ -5,40 +5,40 @@ from comfy.cli_args import args
 import comfy.model_management
 
 import ctypes
-import aimdo.control
+import comfy_aimdo.control
 
 import logging
 
 def get_pin(module):
     return getattr(module, "_pin", None)
 
-PIN_TOTAL=0
+ALL_PINS=[]
 
 def pin_memory(module):
-    global PIN_TOTAL
+    global ALL_PINS
     if module.pin_failed or args.disable_pinned_memory or get_pin(module) is not None:
         return
     #FIXME: This is a RAM cache trigger event
     params = [ module.weight, module.bias ]
     size = comfy.memory_management.vram_aligned_size(params)
     try:
-        PIN_TOTAL += size
-        #logging.info(f"PINNED {module.seed_key} for {PIN_TOTAL / (1024 ** 2)}MB total")
         module._pin = torch.empty((size,), dtype=torch.uint8, pin_memory=True)
+        ALL_PINS.append(module)
     except:
         logging.warning(f"PIN failed for weight {module.seed_key}")
         module.pin_failed = True
         return False
-    comfy.model_management.cast_to_gathered(params, module._pin)
     return True
 
 def unpin_memory(module):
-    global PIN_TOTAL
     if get_pin(module) is not None:
-        PIN_TOTAL -= module._pin.numel()
-        #logging.info(f"UNPINNED {module.seed_key} for {PIN_TOTAL / (1024 ** 2)}MB total")
         del module._pin
 
+def unpin_all():
+    for module in ALL_PINS:
+        logging.info(f"unpin {module.seed_key}")
+        unpin_memory(module)
+    ALL_PINS.clear()
 
 def vram_aligned_size(tensor):
     if isinstance(tensor, list):
@@ -117,4 +117,4 @@ class CUDAPluggableAllocator(torch.cuda.memory.CUDAPluggableAllocator):
         assert free_fn is not None
         self._allocator = torch._C._cuda_customAllocator(alloc_fn, free_fn)
 
-aimdo_allocator = CUDAPluggableAllocator(aimdo.control.lib, "alloc_fn", "free_fn")
+aimdo_allocator = CUDAPluggableAllocator(comfy_aimdo.control.lib, "alloc_fn", "free_fn")

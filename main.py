@@ -171,34 +171,29 @@ import gc
 if 'torch' in sys.modules:
     logging.warning("WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.")
 
-import comfy.memory_management
-import comfy.model_patcher #weird to be first
 
 has_aimdo = False
 
-try:
-    import aimdo.control
-    if args.verbose == 'DEBUG':
-        aimdo.control.set_log_debug()
-    elif args.verbose == 'CRITICAL':
-        aimdo.control.set_log_critical()
-    elif args.verbose == 'ERROR':
-        aimdo.control.set_log_error()
-    elif args.verbose == 'WARNING':
-        aimdo.control.set_log_warning()
-    else: #INFO
-        aimdo.control.set_log_info()
+import comfy_aimdo.control
 
-    #TODO Remove:
-    aimdo.control.set_log_debug()
+if comfy_aimdo.control.lib is not None:
+    if args.verbose == 'DEBUG':
+        comfy_aimdo.control.set_log_debug()
+    elif args.verbose == 'CRITICAL':
+        comfy_aimdo.control.set_log_critical()
+    elif args.verbose == 'ERROR':
+        comfy_aimdo.control.set_log_error()
+    elif args.verbose == 'WARNING':
+        comfy_aimdo.control.set_log_warning()
+    else: #INFO
+        comfy_aimdo.control.set_log_info()
 
     if cuda_malloc.args_enables_dynamic_vram():
-        comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
         logging.info("DynamicVRAM support detected and enabled")
         has_aimdo = True
-except:
+else:
     if cuda_malloc.args_enables_dynamic_vram():
-        logging.info("No aimdo install detected. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows+Nvidia")
+        logging.info("No native comfy-aimdo install detected. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
 
 import comfy.utils
 
@@ -211,8 +206,12 @@ import comfyui_version
 import app.logger
 import hook_breaker_ac10a0
 
+import comfy.memory_management
+import comfy.model_patcher
+
 if has_aimdo:
-    aimdo.control.init_vram_guard(comfy.model_management.get_torch_device().index)
+    comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+    comfy_aimdo.control.init_vram_guard(comfy.model_management.get_torch_device().index)
 else:
     comfy.memory_management.aimdo_allocator = None
 

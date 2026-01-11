@@ -39,11 +39,7 @@ from comfy.comfy_types import UnetWrapperFunction
 from comfy.quant_ops import QuantizedTensor
 from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
 
-try:
-    import aimdo.model_vbar
-except:
-    raise "FY"
-    pass
+import comfy_aimdo.model_vbar
 
 def set_model_options_patch_replace(model_options, patch, name, block_name, number, transformer_index=None):
     to = model_options["transformer_options"].copy()
@@ -1439,7 +1435,7 @@ class ModelPatcherDynamic(ModelPatcher):
             return None
         vbar = self.model.dynamic_vbars.get(self.load_device, None)
         if create and vbar is None:
-            vbar = aimdo.model_vbar.ModelVBAR(self.model_size() * 1.2, self.load_device.index)
+            vbar = comfy_aimdo.model_vbar.ModelVBAR(self.model_size() * 1.2, self.load_device.index)
             self.model.dynamic_vbars[self.load_device] = vbar
         return vbar
  

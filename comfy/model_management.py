@@ -31,10 +31,7 @@ from contextlib import nullcontext
 import comfy.utils
 import comfy.quant_ops
 
-try:
-    import aimdo.model_vbar
-except:
-    pass
+import comfy_aimdo.model_vbar
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -1080,6 +1077,7 @@ def get_cast_buffer(offload_stream, device, size, ref):
             #If there is one giant weight we do not want both streams to
             #allocate a buffer for it. It's up to the caster to get the other
             #offload stream in this corner case
+            logging.info(f"cast buffer nix")
             return None
         if cast_buffer is not None and cast_buffer.numel() > 50 * (1024 ** 2):
             #I want my wrongly sized 50MB+ of VRAM back from the caching allocator right now
@@ -1087,6 +1085,7 @@ def get_cast_buffer(offload_stream, device, size, ref):
             del cast_buffer
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            logging.info(f"cast buffer gazump")
         with wf_context:
             cast_buffer = torch.empty((size), dtype=torch.int8, device=device)
             STREAM_CAST_BUFFERS[offload_stream] = cast_buffer
@@ -1171,16 +1170,16 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
 
         r = torch.empty_like(weight, dtype=dtype, device=device)
 
-        signature = aimdo.model_vbar.vbar_fault(weight._v)
+        signature = comfy_aimdo.model_vbar.vbar_fault(weight._v)
         if signature is not None:
             raw_tensor = comfy.memory_management.aimdo_to_tensor(weight._v, device)
             v_tensor = comfy.memory_management.interpret_gathered_like([weight], raw_tensor)[0]
 
-        if aimdo.model_vbar.vbar_signature_compare(signature, weight._v_signature):
+        if comfy_aimdo.model_vbar.vbar_signature_compare(signature, weight._v_signature):
             #always take a deep copy even if _v is good, as we have no reasonable point to unpin
             #a non comfy weight
             r.copy_(v_tensor)
-            aimdo.model_vbar.vbar_unpin(weight._v)
+            comfy_aimdo.model_vbar.vbar_unpin(weight._v)
             return r
 
         r.copy_(weight, non_blocking=non_blocking)
@@ -1194,7 +1193,7 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
 
         if signature is not None:
             v_tensor.copy_(r)
-            aimdo.model_vbar.vbar_unpin(weight._v)
+            comfy_aimdo.model_vbar.vbar_unpin(weight._v)
 
         return r
 
