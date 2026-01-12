@@ -109,7 +109,7 @@ class HunyuanVideo15SRModel():
         self.model_class = UPSAMPLERS.get(model_type)
         self.model = self.model_class(**config).eval()
 
-        self.patcher = model_patcher.ModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
+        self.patcher = model_patcher.CoreModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
 
     def load_sd(self, sd):
         return self.model.load_state_dict(sd, strict=True)
