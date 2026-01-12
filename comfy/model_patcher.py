@@ -1448,7 +1448,7 @@ class ModelPatcherDynamic(ModelPatcher):
 
 
     def unpin_all_weights(self):
-        for tensor in self.pin_record():
+        for tensor in self.pin_record:
             comfy.model_management.unpin_memory(tensor)
 
 
