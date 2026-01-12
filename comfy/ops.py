@@ -92,7 +92,7 @@ def cast_bias_weight_with_vbar(s, dtype, device, bias_dtype, non_blocking, compu
         if signature is None:
             for tensor in [ s.weight, s.bias ]:
                 if comfy.model_management.pin_memory(tensor):
-                    s.pin_record.append[tensor]
+                    s.pin_record.append(tensor)
 
         dest_size = comfy.memory_management.vram_aligned_size(xfer_source)
         offload_stream = comfy.model_management.get_offload_stream(device)
