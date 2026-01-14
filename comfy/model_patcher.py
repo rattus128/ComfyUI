@@ -662,7 +662,7 @@ class ModelPatcher:
             for name, param in m.named_parameters(recurse=False):
                 params.append(name)
             for name, param in m.named_parameters(recurse=True):
-                if name not in params:
+                if name not in params and not name.startswith("parametrizations."):
                     skip = True # skip random weights in non leaf modules
                     break
             if not skip and (hasattr(m, "comfy_cast_weights") or len(params) > 0):
