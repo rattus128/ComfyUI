@@ -712,9 +712,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
     for loaded_model in models_to_load:
         total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.model_memory_required(loaded_model.device)
         #x2, one to make sure the OS can fit the model for loading in disk cache, and for us to do any pinning we
-        #want to do.
-        #FIXME: This should subtract off the to_load current pin consumption.
-        total_ram_required[loaded_model.device] = total_ram_required.get(loaded_model.device, 0) + loaded_model.model_memory() * 2
+        #want to do. Subtract current pinned memory since it's already resident in RAM.
+        total_ram_required[loaded_model.device] = total_ram_required.get(loaded_model.device, 0) + (loaded_model.model_memory() - loaded_model.model.pinned_memory_size()) * 2
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
