@@ -233,12 +233,14 @@ class LoRAAdapter(WeightAdapterBase):
         original_weight=None,
     ):
         v = self.weights
+        comfy.model_management.FAIL_CAST_TO=False
         mat1 = comfy.model_management.cast_to_device(
             v[0], weight.device, intermediate_dtype
         )
         mat2 = comfy.model_management.cast_to_device(
             v[1], weight.device, intermediate_dtype
         )
+        comfy.model_management.FAIL_CAST_TO=True
         dora_scale = v[4]
         reshape = v[5]
 
