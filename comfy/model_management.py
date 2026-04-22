@@ -1333,6 +1333,8 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
 
     if FAIL_CAST_TO == True:
         raise "FY"
+    else:
+        logging.info(f"Cast")
 
     if stream is not None:
         wf_context = stream
