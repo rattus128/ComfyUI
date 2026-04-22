@@ -1316,6 +1316,7 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None):
                 storage._comfy_tensor_mmap_touched = True
             dest_view.copy_(tensor, non_blocking=non_blocking)
 
+FAIL_CAST_TO=True
 
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None, r=None):
     if device is None or weight.device == device:
@@ -1330,7 +1331,8 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
                 return weight.to(dtype=dtype, copy=copy)
         return weight.to(dtype=dtype, copy=copy)
 
-    logging.info(f"Hello cast_to")
+    if FAIL_CAST_TO == True:
+        raise "FY"
 
     if stream is not None:
         wf_context = stream
