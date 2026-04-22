@@ -1330,6 +1330,7 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
                 return weight.to(dtype=dtype, copy=copy)
         return weight.to(dtype=dtype, copy=copy)
 
+    logging.info(f"Hello cast_to")
 
     if stream is not None:
         wf_context = stream
