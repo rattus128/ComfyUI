@@ -786,7 +786,9 @@ class ModelPatcher:
 
         temp_dtype = comfy.model_management.lora_compute_dtype(device_to) if key in self.patches else None
         if device_to is not None:
+            comfy.model_management.FAIL_CAST_TO=False
             temp_weight = comfy.model_management.cast_to_device(weight, device_to, temp_dtype, copy=True)
+            comfy.model_management.FAIL_CAST_TO=True
         else:
             temp_weight = weight.to(temp_dtype, copy=True)
         if convert_func is not None:
