@@ -92,6 +92,30 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
     cast_buffer = None
     cast_buffer_offset = 0
 
+    def allocate_buffer(module, size):
+        nonlocal offload_stream
+        nonlocal cast_buffer
+        nonlocal cast_buffer_offset
+
+        if size == 0:
+            return None
+        if offload_stream is None:
+            offload_stream = comfy.model_management.get_offload_stream(device)
+        if offload_stream is not None and cast_buffer is None:
+            cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
+            if len(comfy_modules) == 1:
+                if cast_buffer.size() < size and module is comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[0]:
+                    offload_stream = comfy.model_management.get_offload_stream(device)
+                    cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
+                if size > comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[1]:
+                    comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT = (module, size)
+        if cast_buffer is not None:
+            buffer = comfy_aimdo.torch.aimdo_to_tensor(cast_buffer.get(size, cast_buffer_offset), device)
+            cast_buffer_offset += size
+            return buffer
+        offload_stream = None
+        return torch.empty((size,), dtype=torch.uint8, device=device)
+
     for s in comfy_modules:
         signature = comfy_aimdo.model_vbar.vbar_fault(s._v)
         resident = comfy_aimdo.model_vbar.vbar_signature_compare(signature, s._v_signature)
@@ -126,23 +150,8 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
                 break
 
         dest_size = comfy.memory_management.vram_aligned_size(xfer_source)
-        if offload_stream is None:
-            offload_stream = comfy.model_management.get_offload_stream(device)
-        if xfer_dest is None and offload_stream is not None and cast_buffer is None:
-            cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
-            if len(comfy_modules) == 1:
-                if cast_buffer.size() < dest_size and s is comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[0]:
-                    offload_stream = comfy.model_management.get_offload_stream(device)
-                    cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
-                if dest_size > comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[1]:
-                    comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT = (s, dest_size)
         if xfer_dest is None:
-            if cast_buffer is not None:
-                xfer_dest = comfy_aimdo.torch.aimdo_to_tensor(cast_buffer.get(dest_size, cast_buffer_offset), device)
-                cast_buffer_offset += dest_size
-            else:
-                xfer_dest = torch.empty((dest_size,), dtype=torch.uint8, device=device)
-                offload_stream = None
+            xfer_dest = allocate_buffer(s, dest_size)
 
         if signature is None and pin is None:
             comfy.pinned_memory.pin_memory(s)
@@ -155,6 +164,13 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
             xfer_source = [ pin ]
         #send it over
         comfy.model_management.cast_to_gathered(xfer_source, xfer_dest, non_blocking=non_blocking, stream=offload_stream)
+
+        if offload_stream is not None:
+            for param_key in ("weight", "bias"):
+                lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
+                if lowvram_fn is not None:
+                    lowvram_fn.prepare(lambda size: allocate_buffer(s, size), offload_stream, non_blocking)
+
         prefetch["xfer_dest"] = xfer_dest
         prefetch["cast_dest"] = cast_dest
         prefetch["cast_geometry"] = cast_geometry
@@ -237,6 +253,9 @@ def phase_2(s, dtype, device, bias_dtype, non_blocking, compute_dtype, want_requ
         lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
         fns = getattr(s, param_key + "_function", [])
 
+        if x is None:
+            return None
+
         orig = x
 
         def to_dequant(tensor, dtype):
@@ -249,7 +268,7 @@ def phase_2(s, dtype, device, bias_dtype, non_blocking, compute_dtype, want_requ
             x = to_dequant(x, dtype)
         if not resident and lowvram_fn is not None:
             x = to_dequant(x, dtype if compute_dtype is None else compute_dtype)
-            x = lowvram_fn(x)
+            x = lowvram_fn.apply(x)
             if (want_requant and len(fns) == 0 or update_weight):
                 seed = comfy.utils.string_to_seed(s.seed_key)
                 if isinstance(orig, QuantizedTensor):
@@ -266,8 +285,7 @@ def phase_2(s, dtype, device, bias_dtype, non_blocking, compute_dtype, want_requ
 
     update_weight = prefetch["signature"] is not None
     weight = post_cast(s, "weight", weight, dtype, prefetch["resident"], update_weight)
-    bias = None
-    if s.bias is not None:
+    if bias is not None:
         bias = post_cast(s, "bias", bias, bias_dtype, prefetch["resident"], update_weight)
 
     return weight, bias
@@ -321,6 +339,10 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
         if not prefetched:
             if getattr(s, "_prefetch")["signature"] is not None:
                 offload_device = device
+            for param_key in ("weight", "bias"):
+                lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
+                if lowvram_fn is not None:
+                    lowvram_fn.clear_prepared()
             delattr(s, "_prefetch")
         return format_return((weight, bias, (offload_stream, offload_device, None)), offloadable)
 
