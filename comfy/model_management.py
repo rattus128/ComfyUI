@@ -1235,6 +1235,10 @@ def cleanup_prefetched_modules(comfy_modules):
         prefetch = getattr(s, "_prefetch", None)
         if prefetch is None:
             continue
+        for param_key in ("weight", "bias"):
+            lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
+            if lowvram_fn is not None:
+                lowvram_fn.clear_prepared()
         if prefetch["signature"] is not None:
             comfy_aimdo.model_vbar.vbar_unpin(s._v)
         delattr(s, "_prefetch")
