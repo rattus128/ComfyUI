@@ -123,8 +123,8 @@ class LowVramPatch:
         self.set_func = set_func
         self.prepared_patches = None
 
-    def prepare(self, allocate_buffer, stream, non_blocking):
-        self.prepared_patches = comfy.lora.prefetch_patches(self.patches[self.key], allocate_buffer, stream, non_blocking)
+    def prepare(self, allocate_buffer, stream):
+        self.prepared_patches = comfy.lora.prefetch_patches(self.patches[self.key], allocate_buffer, stream)
 
     def clear_prepared(self):
         self.prepared_patches = None

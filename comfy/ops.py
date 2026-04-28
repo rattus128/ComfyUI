@@ -92,29 +92,31 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
     cast_buffer = None
     cast_buffer_offset = 0
 
-    def allocate_buffer(module, size):
+    def allocate_offload(module, buffer_size, check_largest):
         nonlocal offload_stream
         nonlocal cast_buffer
         nonlocal cast_buffer_offset
 
-        if size == 0:
-            return None
         if offload_stream is None:
             offload_stream = comfy.model_management.get_offload_stream(device)
-        if offload_stream is not None and cast_buffer is None:
-            cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
-            if len(comfy_modules) == 1:
-                if cast_buffer.size() < size and module is comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[0]:
+        if buffer_size == 0:
+            return None
+        if offload_stream is not None:
+            required_size = cast_buffer_offset + buffer_size
+            if check_largest and len(comfy_modules) == 1:
+                current_size = 0 if cast_buffer is None else cast_buffer.size()
+                if current_size < required_size and module is comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[0]:
                     offload_stream = comfy.model_management.get_offload_stream(device)
-                    cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
-                if size > comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[1]:
-                    comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT = (module, size)
+                    cast_buffer = None
+                if required_size > comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT[1]:
+                    comfy.model_management.LARGEST_AIMDO_CASTED_WEIGHT = (module, required_size)
+            cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
         if cast_buffer is not None:
-            buffer = comfy_aimdo.torch.aimdo_to_tensor(cast_buffer.get(size, cast_buffer_offset), device)
-            cast_buffer_offset += size
+            buffer = comfy_aimdo.torch.aimdo_to_tensor(cast_buffer.get(buffer_size, cast_buffer_offset), device)
+            cast_buffer_offset += buffer_size
             return buffer
         offload_stream = None
-        return torch.empty((size,), dtype=torch.uint8, device=device)
+        return torch.empty((buffer_size,), dtype=torch.uint8, device=device)
 
     for s in comfy_modules:
         signature = comfy_aimdo.model_vbar.vbar_fault(s._v)
@@ -150,8 +152,9 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
                 break
 
         dest_size = comfy.memory_management.vram_aligned_size(xfer_source)
+        offload = allocate_offload(s, dest_size if xfer_dest is None else 0, True)
         if xfer_dest is None:
-            xfer_dest = allocate_buffer(s, dest_size)
+            xfer_dest = offload
 
         if signature is None and pin is None:
             comfy.pinned_memory.pin_memory(s)
@@ -165,11 +168,11 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
         #send it over
         comfy.model_management.cast_to_gathered(xfer_source, xfer_dest, non_blocking=non_blocking, stream=offload_stream)
 
-        if offload_stream is not None:
-            for param_key in ("weight", "bias"):
-                lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
-                if lowvram_fn is not None:
-                    lowvram_fn.prepare(lambda size: allocate_buffer(s, size), offload_stream, non_blocking)
+        for param_key in ("weight", "bias"):
+            lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
+            if lowvram_fn is not None:
+                allocate_offload(s, 0, False)
+                lowvram_fn.prepare(lambda size: allocate_offload(s, size, False), offload_stream)
 
         prefetch["xfer_dest"] = xfer_dest
         prefetch["cast_dest"] = cast_dest

@@ -405,28 +405,28 @@ def calculate_shape(patches, weight, key, original_weights=None):
     return current_shape
 
 
-def _prefetch_prepared_value(value, allocate_buffer, stream, non_blocking):
+def _prefetch_prepared_value(value, allocate_buffer, stream):
     if isinstance(value, torch.Tensor):
         dest = allocate_buffer(comfy.memory_management.vram_aligned_size(value))
-        comfy.model_management.cast_to_gathered([value], dest, non_blocking=non_blocking, stream=stream)
+        comfy.model_management.cast_to_gathered([value], dest, non_blocking=True, stream=stream)
         return comfy.memory_management.interpret_gathered_like([value], dest)[0]
 
     if isinstance(value, weight_adapter.WeightAdapterBase):
-        return type(value)(value.loaded_keys, _prefetch_prepared_value(value.weights, allocate_buffer, stream, non_blocking))
+        return type(value)(value.loaded_keys, _prefetch_prepared_value(value.weights, allocate_buffer, stream))
 
     if isinstance(value, tuple):
-        return tuple(_prefetch_prepared_value(item, allocate_buffer, stream, non_blocking) for item in value)
+        return tuple(_prefetch_prepared_value(item, allocate_buffer, stream) for item in value)
 
     if isinstance(value, list):
-        return [_prefetch_prepared_value(item, allocate_buffer, stream, non_blocking) for item in value]
+        return [_prefetch_prepared_value(item, allocate_buffer, stream) for item in value]
 
     return value
 
 
-def prefetch_patches(patches, allocate_buffer, stream, non_blocking):
+def prefetch_patches(patches, allocate_buffer, stream):
     materialized = []
     for patch in patches:
-        materialized.append((patch[0], _prefetch_prepared_value(patch[1], allocate_buffer, stream, non_blocking), patch[2], patch[3], patch[4]))
+        materialized.append((patch[0], _prefetch_prepared_value(patch[1], allocate_buffer, stream), patch[2], patch[3], patch[4]))
     return materialized
 
 def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, original_weights=None):
