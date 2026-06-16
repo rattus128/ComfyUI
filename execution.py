@@ -210,6 +210,8 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
                     input_data_all[x] = [dynprompt.get_original_prompt() if dynprompt is not None else {}]
                 if h[x] == "DYNPROMPT":
                     input_data_all[x] = [dynprompt]
+                if h[x] == "EXECUTION_LIST":
+                    input_data_all[x] = [execution_list]
                 if h[x] == "EXTRA_PNGINFO":
                     input_data_all[x] = [extra_data.get('extra_pnginfo', None)]
                 if h[x] == "UNIQUE_ID":
@@ -557,6 +559,10 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                     unblock()
                 asyncio.create_task(await_completion())
                 return (ExecutionResult.PENDING, None, None)
+            if execution_list.is_staged_node_deferred():
+                cache_entry = CacheEntry(ui=None, outputs=output_data)
+                execution_list.cache_update(unique_id, cache_entry)
+                return (ExecutionResult.PENDING, None, None)
         if len(output_ui) > 0:
             # Enrich at output-processing time (not in the send path) so assets
             # are registered even when no client is connected, and the asset id
@@ -781,7 +787,10 @@ class PromptExecutor:
                         break
 
                     assert node_id is not None, "Node ID should not be None at this point"
-                    result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs)
+                    if execution_list.is_spent_node(node_id):
+                        result, error, ex = ExecutionResult.SUCCESS, None, None
+                    else:
+                        result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs)
                     self.success = result != ExecutionResult.FAILURE
                     if result == ExecutionResult.FAILURE:
                         self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)

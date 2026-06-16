@@ -2428,6 +2428,7 @@ async def init_builtin_extra_nodes():
         "nodes_audio_encoder.py",
         "nodes_rope.py",
         "nodes_logic.py",
+        "nodes_loop.py",
         "nodes_resolution.py",
         "nodes_nop.py",
         "nodes_kandinsky5.py",

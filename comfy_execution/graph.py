@@ -9,6 +9,8 @@ from comfy.comfy_types.node_typing import ComfyNodeABC, InputTypeDict, InputType
 # NOTE: ExecutionBlocker code got moved to graph_utils.py to prevent torch being imported too soon during unit tests
 ExecutionBlocker = ExecutionBlocker
 
+PROJECTED_BLOCKER = "__projected__"
+
 class DependencyCycleError(Exception):
     pass
 
@@ -128,7 +130,7 @@ class TopologicalSort:
         self.add_strong_link(from_node_id, from_socket, to_node_id)
 
     def add_strong_link(self, from_node_id, from_socket, to_node_id):
-        if not self.is_cached(from_node_id):
+        if not self.is_cached(from_node_id) or from_node_id in self.pendingNodes:
             self.add_node(from_node_id)
             if to_node_id not in self.blocking[from_node_id]:
                 self.blocking[from_node_id][to_node_id] = {}
@@ -187,7 +189,6 @@ class TopologicalSort:
         for blocked_node_id in self.blocking[unique_id]:
             self.blockers[blocked_node_id].discard(unique_id)
         del self.blocking[unique_id]
-        del self.blockers[unique_id]
 
     def is_empty(self):
         return len(self.pendingNodes) == 0
@@ -203,9 +204,78 @@ class ExecutionList(TopologicalSort):
         self.staged_node_id = None
         self.execution_cache = {}
         self.execution_cache_listeners = {}
+        self.projected_node_counts = {}
+        self.increment_pending_nodes = set()
+        self.spent_nodes = set()
+        self.defer_staged_node_execution = False
 
     def is_cached(self, node_id):
         return self.output_cache.get_local(node_id) is not None
+
+    def effective_blockers(self, node_id):
+        return {
+            blocker_id for blocker_id in self.blockers[node_id]
+            if blocker_id not in self.increment_pending_nodes
+            and self.execution_cache.get(node_id, {}).get(blocker_id) is None
+        }
+
+    def get_ready_nodes(self):
+        available = []
+        for node_id in self.pendingNodes:
+            if len(self.effective_blockers(node_id)) == 0 and node_id not in self.increment_pending_nodes:
+                available.append(node_id)
+        return available
+
+    def project_nodes(self, node_ids):
+        projector_id = self.staged_node_id
+        for node_id in node_ids:
+            if node_id not in self.pendingNodes:
+                self.add_node(node_id)
+            self.projected_node_counts[node_id] = self.projected_node_counts.get(node_id, 0) + 1
+            self.increment_pending_nodes.add(node_id)
+            self.blocking[node_id].setdefault(projector_id, {})[PROJECTED_BLOCKER] = True
+            self.blockers[projector_id].add(node_id)
+
+    def release_projected_nodes(self, node_ids):
+        projector_id = self.staged_node_id
+        for node_id in node_ids:
+            if node_id in self.blocking and projector_id in self.blocking[node_id]:
+                self.blocking[node_id][projector_id].pop(PROJECTED_BLOCKER, None)
+                if len(self.blocking[node_id][projector_id]) == 0:
+                    del self.blocking[node_id][projector_id]
+                    self.blockers[projector_id].discard(node_id)
+
+            count = self.projected_node_counts.get(node_id, 0) - 1
+            if count > 0:
+                self.projected_node_counts[node_id] = count
+            else:
+                self.projected_node_counts.pop(node_id, None)
+                if node_id in self.increment_pending_nodes:
+                    self.increment_pending_nodes.discard(node_id)
+                    self.spent_nodes.add(node_id)
+
+    def is_spent_node(self, node_id):
+        return node_id in self.spent_nodes
+
+    def all_increment_pending(self, node_ids):
+        return all(node_id in self.increment_pending_nodes for node_id in node_ids)
+
+    def defer_staged_node(self):
+        self.defer_staged_node_execution = True
+
+    def is_staged_node_deferred(self):
+        return self.defer_staged_node_execution
+
+    def requeue_nodes(self, node_ids):
+        node_ids = set(node_ids)
+        for node_id in node_ids:
+            self.output_cache.set_local(node_id, None)
+            self.increment_pending_nodes.discard(node_id)
+            if node_id not in self.pendingNodes:
+                self.add_node(node_id)
+            for from_node_id in self.execution_cache[node_id]:
+                if from_node_id in node_ids:
+                    self.execution_cache[node_id][from_node_id] = None
 
     def cache_link(self, from_node_id, to_node_id):
         if to_node_id not in self.execution_cache:
@@ -222,7 +292,8 @@ class ExecutionList(TopologicalSort):
         if value is None:
             return None
         #Write back to the main cache on touch.
-        self.output_cache.set_local(from_node_id, value)
+        if from_node_id not in self.pendingNodes:
+            self.output_cache.set_local(from_node_id, value)
         return value
 
     def cache_update(self, node_id, value):
@@ -300,6 +371,8 @@ class ExecutionList(TopologicalSort):
         #This should handle the VAELoader -> VAEDecode -> preview case
         for node_id in node_list:
             for blocked_node_id in self.blocking[node_id]:
+                if blocked_node_id not in self.pendingNodes:
+                    continue
                 for blocked_node_id1 in self.blocking[blocked_node_id]:
                     if is_output(blocked_node_id1):
                         return node_id
@@ -309,10 +382,17 @@ class ExecutionList(TopologicalSort):
 
     def unstage_node_execution(self):
         assert self.staged_node_id is not None
+        self.defer_staged_node_execution = False
         self.staged_node_id = None
 
     def complete_node_execution(self):
         node_id = self.staged_node_id
+        self.defer_staged_node_execution = False
+        if node_id in self.projected_node_counts:
+            self.increment_pending_nodes.add(node_id)
+            self.staged_node_id = None
+            return
+        self.spent_nodes.discard(node_id)
         self.pop_node(node_id)
         self.execution_cache.pop(node_id, None)
         self.execution_cache_listeners.pop(node_id, None)
