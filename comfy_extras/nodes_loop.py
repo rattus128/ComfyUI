@@ -47,8 +47,8 @@ class ForLoopOpen:
             }
         }
 
-    RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("i",)
+    RETURN_TYPES = ("INT", "BOOLEAN")
+    RETURN_NAMES = ("i", "last")
     FUNCTION = "open"
     CATEGORY = "looping"
 
@@ -66,11 +66,11 @@ class ForLoopOpen:
         if self.index >= len(self.values):
             execution_list.release_projected_nodes(self.projected_nodes)
             self.projected_nodes = set()
-            return (None,)
+            return (None, True)
 
         execution_list.requeue_nodes(self.projected_nodes)
         execution_list.defer_staged_node()
-        return (self.values[self.index],)
+        return (self.values[self.index], self.index == len(self.values) - 1)
 
 
 class GlobalVariableSet:
