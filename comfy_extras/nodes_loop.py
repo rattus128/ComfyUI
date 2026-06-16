@@ -104,6 +104,7 @@ class GlobalVariableGet:
                 "name": ("STRING", {"default": "variable"}),
             },
             "optional": {
+                "default": ("*",),
                 "dependency": ("*",),
             },
         }
@@ -112,11 +113,11 @@ class GlobalVariableGet:
     FUNCTION = "get"
     CATEGORY = "looping"
 
-    def get(self, name, dependency=None):
-        return (GLOBAL_VARIABLES.get(name),)
+    def get(self, name, default=None, dependency=None):
+        return (GLOBAL_VARIABLES.get(name, default),)
 
     @classmethod
-    def IS_CHANGED(cls, name, dependency=None):
+    def IS_CHANGED(cls, name, default=None, dependency=None):
         return float("NaN")
 
 
