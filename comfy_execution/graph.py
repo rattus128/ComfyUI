@@ -226,13 +226,16 @@ class ExecutionList(TopologicalSort):
                 available.append(node_id)
         return available
 
-    def project_nodes(self, node_ids):
+    def project_nodes(self, node_ids, scheduled_node_ids=None):
         projector_id = self.staged_node_id
+        scheduled_node_ids = set(node_ids if scheduled_node_ids is None else scheduled_node_ids)
         for node_id in node_ids:
-            if node_id not in self.pendingNodes:
+            if node_id in scheduled_node_ids and node_id not in self.pendingNodes:
                 self.add_node(node_id)
             self.projected_node_counts[node_id] = self.projected_node_counts.get(node_id, 0) + 1
             self.increment_pending_nodes.add(node_id)
+            if node_id not in scheduled_node_ids:
+                continue
             self.blocking[node_id].setdefault(projector_id, {})[PROJECTED_BLOCKER] = True
             self.blockers[projector_id].add(node_id)
 
@@ -252,7 +255,8 @@ class ExecutionList(TopologicalSort):
                 self.projected_node_counts.pop(node_id, None)
                 if node_id in self.increment_pending_nodes:
                     self.increment_pending_nodes.discard(node_id)
-                    self.spent_nodes.add(node_id)
+                    if node_id in self.pendingNodes:
+                        self.spent_nodes.add(node_id)
 
     def is_spent_node(self, node_id):
         return node_id in self.spent_nodes
@@ -266,16 +270,61 @@ class ExecutionList(TopologicalSort):
     def is_staged_node_deferred(self):
         return self.defer_staged_node_execution
 
-    def requeue_nodes(self, node_ids):
+    def requeue_nodes(self, node_ids, invalidate_node_ids=None):
         node_ids = set(node_ids)
+        invalidate_node_ids = set(node_ids if invalidate_node_ids is None else invalidate_node_ids)
+        for node_id in invalidate_node_ids:
+            cache = self.output_cache
+            if hasattr(cache, "_get_cache_for"):
+                cache = cache._get_cache_for(node_id)
+            if cache is not None and getattr(cache, "initialized", False):
+                cache_key = cache.cache_key_set.get_data_key(node_id)
+                if cache_key is not None:
+                    cache.cache.pop(cache_key, None)
+            if node_id in self.projected_node_counts:
+                self.increment_pending_nodes.add(node_id)
+            for from_node_id in self.execution_cache.get(node_id, {}):
+                if from_node_id in invalidate_node_ids:
+                    self.execution_cache[node_id][from_node_id] = None
+
         for node_id in node_ids:
-            self.output_cache.set_local(node_id, None)
             self.increment_pending_nodes.discard(node_id)
             if node_id not in self.pendingNodes:
                 self.add_node(node_id)
-            for from_node_id in self.execution_cache[node_id]:
-                if from_node_id in node_ids:
-                    self.execution_cache[node_id][from_node_id] = None
+
+    def requeue_lazy_input(self, to_node_id, to_input):
+        node_ids = []
+        seen = set()
+        stack = [self.dynprompt.get_node(to_node_id)["inputs"][to_input][0]]
+        while stack:
+            node_id = stack.pop()
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            if self.is_cached(node_id):
+                continue
+            elif node_id in self.increment_pending_nodes:
+                node_ids.append(node_id)
+            elif node_id in self.projected_node_counts:
+                if node_id not in self.pendingNodes:
+                    node_ids.append(node_id)
+                else:
+                    continue
+            elif node_id not in self.pendingNodes:
+                self.add_node(node_id)
+
+            inputs = self.dynprompt.get_node(node_id)["inputs"]
+            for input_name, value in inputs.items():
+                if not is_link(value):
+                    continue
+                _, _, input_info = self.get_input_info(node_id, input_name)
+                if input_info is not None and input_info.get("lazy", False):
+                    continue
+                stack.append(value[0])
+
+        if node_ids:
+            self.requeue_nodes(node_ids)
 
     def cache_link(self, from_node_id, to_node_id):
         if to_node_id not in self.execution_cache:
@@ -292,7 +341,7 @@ class ExecutionList(TopologicalSort):
         if value is None:
             return None
         #Write back to the main cache on touch.
-        if from_node_id not in self.pendingNodes:
+        if from_node_id not in self.pendingNodes or from_node_id in self.projected_node_counts:
             self.output_cache.set_local(from_node_id, value)
         return value
 
@@ -305,6 +354,11 @@ class ExecutionList(TopologicalSort):
     def add_strong_link(self, from_node_id, from_socket, to_node_id):
         super().add_strong_link(from_node_id, from_socket, to_node_id)
         self.cache_link(from_node_id, to_node_id)
+
+    def make_input_strong_link(self, to_node_id, to_input):
+        if to_node_id in self.projected_node_counts:
+            self.requeue_lazy_input(to_node_id, to_input)
+        super().make_input_strong_link(to_node_id, to_input)
 
     async def stage_node_execution(self):
         assert self.staged_node_id is None
@@ -320,6 +374,8 @@ class ExecutionList(TopologicalSort):
             cycled_nodes = self.get_nodes_in_cycle()
             # Because cycles composed entirely of static nodes are caught during initial validation,
             # we will 'blame' the first node in the cycle that is not a static node.
+            if len(cycled_nodes) == 0:
+                cycled_nodes = list(self.pendingNodes)
             blamed_node = cycled_nodes[0]
             for node_id in cycled_nodes:
                 display_node_id = self.dynprompt.get_display_node_id(node_id)

@@ -11,6 +11,9 @@ from fractions import Fraction
 from comfy_api.latest import ComfyExtension, io, ui, Input, InputImpl, Types
 from comfy.cli_args import args
 
+ACCUMULATE_SAVE_VIDEO_STATES = {}
+ACCUMULATE_SAVE_VIDEO_PROMPT_ID = None
+
 class SaveWEBM(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -123,8 +126,6 @@ class SaveVideo(io.ComfyNode):
 
 
 class AccumulateSaveVideo(io.ComfyNode):
-    _states = {}
-
     @classmethod
     def define_schema(cls):
         return io.Schema(
@@ -141,15 +142,25 @@ class AccumulateSaveVideo(io.ComfyNode):
                 io.Boolean.Input("last", default=False),
                 io.Audio.Input("complete_audio", optional=True, tooltip="Optional complete audio track to write once at finalization."),
             ],
-            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo, io.Hidden.unique_id],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo, io.Hidden.unique_id, io.Hidden.dynprompt],
             is_output_node=True,
         )
 
     @classmethod
     def execute(cls, video: Input.Video, filename_prefix, format: str, codec, last: bool, complete_audio: Optional[Input.Audio] = None) -> io.NodeOutput:
+        global ACCUMULATE_SAVE_VIDEO_PROMPT_ID
+        prompt_id = id(cls.hidden.dynprompt)
+        if ACCUMULATE_SAVE_VIDEO_PROMPT_ID != prompt_id:
+            for state in ACCUMULATE_SAVE_VIDEO_STATES.values():
+                state["output"].close()
+                if os.path.exists(state["path"]):
+                    os.remove(state["path"])
+            ACCUMULATE_SAVE_VIDEO_STATES.clear()
+            ACCUMULATE_SAVE_VIDEO_PROMPT_ID = prompt_id
+
         node_id = cls.hidden.unique_id or "default"
         components = video.get_components()
-        state = cls._states.get(node_id)
+        state = ACCUMULATE_SAVE_VIDEO_STATES.get(node_id)
         if state is None:
             if Types.VideoContainer(format) not in (Types.VideoContainer.AUTO, Types.VideoContainer.MP4):
                 raise ValueError("Only MP4 format is supported for now")
@@ -195,7 +206,7 @@ class AccumulateSaveVideo(io.ComfyNode):
                 layout = {1: "mono", 2: "stereo", 6: "5.1"}.get(channels, "stereo")
                 audio_stream = output.add_stream("aac", rate=audio_sample_rate, layout=layout)
 
-            state = cls._states[node_id] = {
+            state = ACCUMULATE_SAVE_VIDEO_STATES[node_id] = {
                 "path": path, "file": file, "subfolder": subfolder, "output": output,
                 "video_stream": video_stream, "audio_stream": audio_stream, "audio_sample_rate": audio_sample_rate,
                 "frame_rate": frame_rate, "frame_count": 0, "is_10bit": is_10bit, "pix_fmt": pix_fmt,
@@ -239,15 +250,18 @@ class AccumulateSaveVideo(io.ComfyNode):
                 for packet in state["audio_stream"].encode(None):
                     state["output"].mux(packet)
             state["output"].close()
-            cls._states.pop(node_id, None)
+            ACCUMULATE_SAVE_VIDEO_STATES.pop(node_id, None)
             return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(state["file"], state["subfolder"], io.FolderType.output)]))
         except Exception:
             state["output"].close()
-            cls._states.pop(node_id, None)
+            ACCUMULATE_SAVE_VIDEO_STATES.pop(node_id, None)
             if os.path.exists(state["path"]):
                 os.remove(state["path"])
             raise
 
+    @classmethod
+    def IS_CHANGED(cls, video, filename_prefix, format: str, codec, last: bool, complete_audio: Optional[Input.Audio] = None):
+        return float("NaN")
 
 class CreateVideo(io.ComfyNode):
     @classmethod

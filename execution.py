@@ -518,6 +518,8 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                         execution_list.make_input_strong_link(unique_id, i)
                     return (ExecutionResult.PENDING, None, None)
 
+            logging.info("Executing node %s (%s)", unique_id, class_type)
+
             def execution_block_cb(block):
                 if block.message is not None:
                     mes = {
