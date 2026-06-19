@@ -562,8 +562,9 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 asyncio.create_task(await_completion())
                 return (ExecutionResult.PENDING, None, None)
             if execution_list.is_staged_node_deferred():
-                cache_entry = CacheEntry(ui=None, outputs=output_data)
-                execution_list.cache_update(unique_id, cache_entry)
+                if execution_list.should_cache_deferred_staged_node():
+                    cache_entry = CacheEntry(ui=None, outputs=output_data)
+                    execution_list.cache_update(unique_id, cache_entry)
                 return (ExecutionResult.PENDING, None, None)
         if len(output_ui) > 0:
             # Enrich at output-processing time (not in the send path) so assets
