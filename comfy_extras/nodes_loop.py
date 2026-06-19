@@ -1,4 +1,4 @@
-from comfy_execution.graph_utils import is_link
+from comfy_extras.graph_traversal import descendants
 
 
 GLOBAL_VARIABLES = {}
@@ -12,25 +12,6 @@ def prompt_variables(dynprompt):
         GLOBAL_VARIABLES.clear()
         GLOBAL_VARIABLE_PROMPT_ID = prompt_id
     return GLOBAL_VARIABLES
-
-
-def descendants(dynprompt, node_id):
-    children = {}
-    for candidate_id in dynprompt.all_node_ids():
-        node = dynprompt.get_node(candidate_id)
-        for value in node.get("inputs", {}).values():
-            if is_link(value):
-                children.setdefault(value[0], set()).add(candidate_id)
-
-    found = set()
-    stack = list(children.get(node_id, ()))
-    while stack:
-        child_id = stack.pop()
-        if child_id in found:
-            continue
-        found.add(child_id)
-        stack.extend(children.get(child_id, ()))
-    return found
 
 
 class ForLoopOpen:
