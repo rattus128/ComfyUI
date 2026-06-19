@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Type, Literal
 
 import nodes
@@ -10,6 +11,12 @@ from comfy.comfy_types.node_typing import ComfyNodeABC, InputTypeDict, InputType
 ExecutionBlocker = ExecutionBlocker
 
 PROJECTED_BLOCKER = "__projected__"
+
+
+class DeferredStagedNodeState(IntEnum):
+    NOT_DEFERRED = 0
+    DEFERRED = 1
+    DEFERRED_WITH_CACHE = 2
 
 class DependencyCycleError(Exception):
     pass
@@ -207,8 +214,7 @@ class ExecutionList(TopologicalSort):
         self.projected_node_counts = {}
         self.increment_pending_nodes = set()
         self.spent_nodes = set()
-        self.defer_staged_node_execution = False
-        self.defer_staged_node_cache_outputs = True
+        self.deferred_staged_node_state = DeferredStagedNodeState.NOT_DEFERRED
 
     def is_cached(self, node_id):
         return self.output_cache.get_local(node_id) is not None
@@ -265,15 +271,14 @@ class ExecutionList(TopologicalSort):
     def all_increment_pending(self, node_ids):
         return all(node_id in self.increment_pending_nodes for node_id in node_ids)
 
-    def defer_staged_node(self, cache_outputs=True):
-        self.defer_staged_node_execution = True
-        self.defer_staged_node_cache_outputs = cache_outputs
+    def defer_staged_node(self, state=DeferredStagedNodeState.DEFERRED_WITH_CACHE):
+        self.deferred_staged_node_state = DeferredStagedNodeState(state)
 
     def is_staged_node_deferred(self):
-        return self.defer_staged_node_execution
+        return self.deferred_staged_node_state != DeferredStagedNodeState.NOT_DEFERRED
 
     def should_cache_deferred_staged_node(self):
-        return self.defer_staged_node_cache_outputs
+        return self.deferred_staged_node_state == DeferredStagedNodeState.DEFERRED_WITH_CACHE
 
     def requeue_nodes(self, node_ids, invalidate_node_ids=None):
         node_ids = set(node_ids)
@@ -443,14 +448,12 @@ class ExecutionList(TopologicalSort):
 
     def unstage_node_execution(self):
         assert self.staged_node_id is not None
-        self.defer_staged_node_execution = False
-        self.defer_staged_node_cache_outputs = True
+        self.deferred_staged_node_state = DeferredStagedNodeState.NOT_DEFERRED
         self.staged_node_id = None
 
     def complete_node_execution(self):
         node_id = self.staged_node_id
-        self.defer_staged_node_execution = False
-        self.defer_staged_node_cache_outputs = True
+        self.deferred_staged_node_state = DeferredStagedNodeState.NOT_DEFERRED
         if node_id in self.projected_node_counts:
             self.increment_pending_nodes.add(node_id)
             self.staged_node_id = None
