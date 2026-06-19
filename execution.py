@@ -31,6 +31,7 @@ from comfy_execution.caching import (
     RAMPressureCache,
 )
 from comfy_execution.graph import (
+    DeferredStagedNodeState,
     DynamicPrompt,
     ExecutionBlocker,
     ExecutionList,
@@ -561,8 +562,9 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                     unblock()
                 asyncio.create_task(await_completion())
                 return (ExecutionResult.PENDING, None, None)
-            if execution_list.is_staged_node_deferred():
-                if execution_list.should_cache_deferred_staged_node():
+            defer_staged_state = execution_list.get_defer_staged_state()
+            if defer_staged_state != DeferredStagedNodeState.NOT_DEFERRED:
+                if defer_staged_state == DeferredStagedNodeState.DEFERRED_WITH_CACHE:
                     cache_entry = CacheEntry(ui=None, outputs=output_data)
                     execution_list.cache_update(unique_id, cache_entry)
                 return (ExecutionResult.PENDING, None, None)

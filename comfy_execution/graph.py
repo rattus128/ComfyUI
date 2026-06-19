@@ -274,11 +274,8 @@ class ExecutionList(TopologicalSort):
     def defer_staged_node(self, state=DeferredStagedNodeState.DEFERRED_WITH_CACHE):
         self.deferred_staged_node_state = DeferredStagedNodeState(state)
 
-    def is_staged_node_deferred(self):
-        return self.deferred_staged_node_state != DeferredStagedNodeState.NOT_DEFERRED
-
-    def should_cache_deferred_staged_node(self):
-        return self.deferred_staged_node_state == DeferredStagedNodeState.DEFERRED_WITH_CACHE
+    def get_defer_staged_state(self):
+        return self.deferred_staged_node_state
 
     def requeue_nodes(self, node_ids, invalidate_node_ids=None):
         node_ids = set(node_ids)
