@@ -28,6 +28,7 @@ import comfy.pinned_memory
 import comfy.utils
 
 import comfy_aimdo.model_vbar
+import comfy_aimdo.control
 import comfy_aimdo.torch
 
 def run_every_op():
@@ -118,7 +119,8 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
             return None
 
         if offload_stream is None:
-            return torch.empty((buffer_size,), dtype=torch.uint8, device=device)
+            with comfy_aimdo.control.suspend_recording():
+                return torch.empty((buffer_size,), dtype=torch.uint8, device=device)
 
         cast_buffer = comfy.model_management.get_aimdo_cast_buffer(offload_stream, device)
         buffer = comfy_aimdo.torch.aimdo_to_tensor(cast_buffer.get(buffer_size, cast_buffer_offset), device)
@@ -220,7 +222,10 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
     else:
         xfer_dest = prefetch["xfer_dest"]
         if prefetch["needs_cast"]:
-            cast_dest = prefetch["cast_dest"] if prefetch["cast_dest"] is not None else torch.empty((comfy.memory_management.vram_aligned_size(prefetch["cast_geometry"]),), dtype=torch.uint8, device=device)
+            cast_dest = prefetch["cast_dest"]
+            if cast_dest is None:
+                with comfy_aimdo.control.suspend_recording():
+                    cast_dest = torch.empty((comfy.memory_management.vram_aligned_size(prefetch["cast_geometry"]),), dtype=torch.uint8, device=device)
             for pre_cast, post_cast in zip(comfy.memory_management.interpret_gathered_like([s.weight, s.bias ], xfer_dest),
                                            comfy.memory_management.interpret_gathered_like(prefetch["cast_geometry"], cast_dest)):
                 if post_cast is not None:
@@ -253,18 +258,19 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
         if orig.dtype != dtype or len(fns) > 0:
             x = to_dequant(x, dtype)
         if not resident and lowvram_fn is not None:
-            x = to_dequant(x, dtype if compute_dtype is None else compute_dtype)
-            x = lowvram_fn(x)
-            if (want_requant and len(fns) == 0 or update_weight):
-                seed = comfy.utils.string_to_seed(s.seed_key)
-                if isinstance(orig, QuantizedTensor):
-                    y = orig.requantize_from_float(x, scale="recalculate", stochastic_rounding=seed)
-                else:
-                    y = comfy.float.stochastic_rounding(x, orig.dtype, seed=seed)
-            if want_requant and len(fns) == 0:
-                x = y
-            if update_weight:
-                orig.copy_(y)
+            with comfy_aimdo.control.suspend_recording():
+                x = to_dequant(x, dtype if compute_dtype is None else compute_dtype)
+                x = lowvram_fn(x)
+                if (want_requant and len(fns) == 0 or update_weight):
+                    seed = comfy.utils.string_to_seed(s.seed_key)
+                    if isinstance(orig, QuantizedTensor):
+                        y = orig.requantize_from_float(x, scale="recalculate", stochastic_rounding=seed)
+                    else:
+                        y = comfy.float.stochastic_rounding(x, orig.dtype, seed=seed)
+                if want_requant and len(fns) == 0:
+                    x = y
+                if update_weight:
+                    orig.copy_(y)
         for f in fns:
             x = f(x)
         return x
