@@ -16,7 +16,11 @@ from comfy.ldm.lightricks.model import (
 from comfy.ldm.lightricks.symmetric_patchifier import AudioPatchifier
 from comfy.ldm.lightricks.embeddings_connector import Embeddings1DConnector
 import comfy.ldm.common_dit
+import comfy.aimdo_graph
+import comfy.memory_management
+import comfy.model_management
 import comfy.model_prefetch
+import comfy_aimdo.control
 
 class CompressedTimestep:
     """Store video timestep embeddings in compressed form using per-frame indexing."""
@@ -376,6 +380,29 @@ class BasicAVTransformerBlock(nn.Module):
 
 
 class LTXAVModel(LTXVModel):
+    def _forward(
+        self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
+    ):
+        device = x[0].device
+        record = comfy.memory_management.aimdo_enabled and device.type == "cuda"
+        if record:
+            stream = comfy.model_management.current_stream(device)
+            graph_key = comfy.aimdo_graph.key(stream.cuda_stream, x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask, kwargs)
+            warmed, graph = comfy.aimdo_graph.get(self, graph_key)
+            if warmed:
+                output = [torch.empty_like(value) for value in x]
+                comfy_aimdo.control.push_record(stream, graph)
+                comfy_aimdo.control.iterate()
+                result = super(LTXVModel, self)._forward(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask, **kwargs)
+                for destination, value in zip(output, result):
+                    destination.copy_(value)
+                del value
+                del result
+                comfy.aimdo_graph.put(self, graph_key, comfy_aimdo.control.pop())
+                return output
+            comfy.aimdo_graph.put(self, graph_key, None)
+        return super(LTXVModel, self)._forward(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask, **kwargs)
+
     """LTXAV model for audio-video generation."""
 
     def __init__(
