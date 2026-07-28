@@ -29,6 +29,7 @@ import torch
 import tqdm
 
 import comfy.float
+import comfy.aimdo_graph
 import comfy.hooks
 import comfy.lora
 import comfy.model_management
@@ -1256,6 +1257,7 @@ class ModelPatcher:
         return comfy.lora.calculate_weight(patches, weight, key, intermediate_dtype=intermediate_dtype)
 
     def cleanup(self):
+        comfy.aimdo_graph.clear(self.model.diffusion_model)
         self.model_patches_call_function(function_name="cleanup")
         self.clean_hooks()
         if hasattr(self.model, "current_patcher"):
