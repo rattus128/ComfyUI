@@ -9,11 +9,14 @@ from einops import rearrange
 import numpy as np
 import torch
 from torch import nn
+import comfy.aimdo_graph
+import comfy.memory_management
 import comfy.patcher_extension
 import comfy.ldm.modules.attention
 import comfy.ldm.common_dit
 import comfy.model_management
 import comfy.quant_ops
+import comfy_aimdo.control
 
 from .symmetric_patchifier import SymmetricPatchifier, latent_to_pixel_coords
 
@@ -1001,6 +1004,26 @@ class LTXBaseModel(torch.nn.Module, ABC):
 class LTXVModel(LTXBaseModel):
     """LTXV model for video generation."""
 
+    def _forward(
+        self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, _aimdo_replay=False, **kwargs
+    ):
+        record = comfy.memory_management.aimdo_enabled and x.device.type == "cuda" and not _aimdo_replay
+        if record:
+            stream = comfy.model_management.current_stream(x.device)
+            graph_key = comfy.aimdo_graph.key(stream.cuda_stream, x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask, kwargs)
+            warmed, graph = comfy.aimdo_graph.get(self, graph_key)
+            if warmed:
+                output = torch.empty_like(x)
+                comfy_aimdo.control.push_record(stream, graph)
+                comfy_aimdo.control.iterate()
+                result = super()._forward(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask, _aimdo_record=True, **kwargs)
+                output.copy_(result)
+                del result
+                comfy.aimdo_graph.put(self, graph_key, comfy_aimdo.control.pop())
+                return output
+            comfy.aimdo_graph.put(self, graph_key, None)
+        return super()._forward(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask, **kwargs)
+
     def __init__(
         self,
         in_channels=128,
@@ -1294,7 +1317,15 @@ class LTXVModel(LTXBaseModel):
         blocks_replace = patches_replace.get("dit", {})
         prompt_timestep = kwargs.get("prompt_timestep", None)
 
+        record = kwargs.get("_aimdo_record", False)
+        if record:
+            x = x.contiguous()
+            loop_x = x
+            stream = comfy.model_management.current_stream(x.device)
+            comfy_aimdo.control.push_record(stream)
         for i, block in enumerate(self.transformer_blocks):
+            if record:
+                comfy_aimdo.control.iterate()
             if ("double_block", i) in blocks_replace:
 
                 def block_wrap(args):
@@ -1315,6 +1346,12 @@ class LTXVModel(LTXBaseModel):
                     self_attention_mask=self_attention_mask,
                     prompt_timestep=prompt_timestep,
                 )
+            if record:
+                loop_x.copy_(x)
+                del x
+                x = loop_x
+        if record:
+            comfy_aimdo.control.pop()
 
         return x
 
