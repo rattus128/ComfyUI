@@ -10,8 +10,11 @@ from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.flux.math import apply_rope1, rope
 import comfy.ldm.common_dit
+import comfy.aimdo_graph
+import comfy.memory_management
 import comfy.model_management
 import comfy.patcher_extension
+import comfy_aimdo.control
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -528,6 +531,7 @@ class WanModel(torch.nn.Module):
         clip_fea=None,
         freqs=None,
         transformer_options={},
+        _aimdo_record=False,
         **kwargs,
     ):
         r"""
@@ -596,7 +600,14 @@ class WanModel(torch.nn.Module):
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.blocks)
         transformer_options["block_type"] = "double"
+        if _aimdo_record:
+            x = x.contiguous()
+            loop_x = x
+            stream = comfy.model_management.current_stream(x.device)
+            comfy_aimdo.control.push_record(stream)
         for i, block in enumerate(self.blocks):
+            if _aimdo_record:
+                comfy_aimdo.control.iterate()
             transformer_options["block_index"] = i
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
@@ -612,6 +623,12 @@ class WanModel(torch.nn.Module):
                 for p in patches["double_block"]:
                     out = p({"img": x, "x": x_input, "vec": e, "block_index": i, "img_offset": img_offset, "transformer_options": transformer_options})
                     x = out["img"]
+            if _aimdo_record:
+                loop_x.copy_(x)
+                del x
+                x = loop_x
+        if _aimdo_record:
+            comfy_aimdo.control.pop()
 
         # head
         x = self.head(x, e)
@@ -696,6 +713,22 @@ class WanModel(torch.nn.Module):
             for i, lat in enumerate(context_latents):
                 freqs = torch.cat([freqs, self.rope_encode(lat.shape[-3], lat.shape[-2], lat.shape[-1], device=x.device, dtype=x.dtype, transformer_options=transformer_options, source_id=i + 1)], dim=1)
             kwargs = {**kwargs, "context_latents": context_latents}
+
+        record = comfy.memory_management.aimdo_enabled and x.device.type == "cuda"
+        if record:
+            stream = comfy.model_management.current_stream(x.device)
+            graph_key = comfy.aimdo_graph.key(stream.cuda_stream, x, timestep, context, clip_fea, freqs, transformer_options, kwargs)
+            warmed, graph = comfy.aimdo_graph.get(self, graph_key)
+            if warmed:
+                output = torch.empty((bs, self.out_dim, t, h, w), dtype=x.dtype, device=x.device)
+                comfy_aimdo.control.push_record(stream, graph)
+                comfy_aimdo.control.iterate()
+                result = self.forward_orig(x, timestep, context, clip_fea=clip_fea, freqs=freqs, transformer_options=transformer_options, _aimdo_record=True, **kwargs)[:, :, :t, :h, :w]
+                output.copy_(result)
+                del result
+                comfy.aimdo_graph.put(self, graph_key, comfy_aimdo.control.pop())
+                return output
+            comfy.aimdo_graph.put(self, graph_key, None)
 
         return self.forward_orig(x, timestep, context, clip_fea=clip_fea, freqs=freqs, transformer_options=transformer_options, **kwargs)[:, :, :t, :h, :w]
 
