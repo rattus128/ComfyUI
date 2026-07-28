@@ -778,6 +778,9 @@ class LoadedModel:
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
         if memory_to_free is not None:
+            if self.model.is_dynamic():
+                self.model.partially_unload(self.model.offload_device, memory_to_free)
+                return False
             if memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
                 if freed >= memory_to_free:
@@ -2000,8 +2003,10 @@ def soft_empty_cache(force=False):
         torch.cuda.ipc_collect()
 
 def unload_all_models():
-    for device in get_all_torch_devices():
-        free_memory(1e30, device)
+    for loaded_model in current_loaded_models:
+        loaded_model.model_unload()
+    current_loaded_models.clear()
+    soft_empty_cache()
 
 def unload_model_and_clones(model: ModelPatcher, unload_additional_models=True, all_devices=False):
     'Unload only model and its clones - primarily for multigpu cloning purposes.'
@@ -2023,11 +2028,13 @@ def unload_model_and_clones(model: ModelPatcher, unload_additional_models=True, 
             if skip:
                 continue
         keep_loaded.append(loaded_model)
-    if not all_devices:
-        free_memory(1e30, get_torch_device(), keep_loaded)
-    else:
-        for device in get_all_torch_devices():
-            free_memory(1e30, device, keep_loaded)
+    devices = get_all_torch_devices() if all_devices else [get_torch_device()]
+    for i in range(len(current_loaded_models) - 1, -1, -1):
+        loaded_model = current_loaded_models[i]
+        if loaded_model not in keep_loaded and loaded_model.device in devices:
+            loaded_model.model_unload()
+            current_loaded_models.pop(i)
+    soft_empty_cache()
 
 def debug_memory_summary():
     if is_amd() or is_nvidia():
