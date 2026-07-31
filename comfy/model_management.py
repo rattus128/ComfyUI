@@ -32,6 +32,7 @@ from contextlib import contextmanager, nullcontext
 import comfy.memory_management
 import comfy.utils
 import comfy.quant_ops
+import comfy.windows_memory
 import comfy_aimdo.host_buffer
 import comfy_aimdo.vram_buffer
 from comfy.logging import detail
@@ -363,6 +364,10 @@ def mac_version():
 total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
 total_ram = psutil.virtual_memory().total / (1024 * 1024)
 logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
+if cpu_state == CPUState.GPU and not directml_enabled:
+    recommended_pagefile = comfy.windows_memory.recommended_pagefile_size(total_vram * 1024 * 1024)
+    if recommended_pagefile is not None:
+        logging.warning("Recommended Windows pagefile size: at least {} GB.".format(recommended_pagefile // (1024 ** 3)))
 
 try:
     logging.info("pytorch version: {}".format(torch_version))
