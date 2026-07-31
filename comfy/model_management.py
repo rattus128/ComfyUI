@@ -367,6 +367,8 @@ logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, to
 if cpu_state == CPUState.GPU and not directml_enabled:
     recommended_pagefile = comfy.windows_memory.recommended_pagefile_size(total_vram * 1024 * 1024)
     if recommended_pagefile is not None:
+        args.fast_disk = True
+        args.high_ram = False
         logging.warning("Recommended Windows pagefile size: at least {} GB.".format(recommended_pagefile // (1024 ** 3)))
 
 try:
