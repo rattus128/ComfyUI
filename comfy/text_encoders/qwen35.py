@@ -4,9 +4,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import contextlib
-import logging
 import os
-import time
 import warnings
 
 import comfy.model_management
@@ -983,23 +981,14 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             return accepts, commit
 
         probe = None if fixed_depth is not None else [0, 0]  # steps, accepted drafts
-        decode_steps = 0
-        drafted_tokens = 0
-        accepted_drafts = 0
-        decode_start = None
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
             if use_graph and len(ids) < max_length and ids[-1] not in stop_tokens:
                 draft_capture()
-            torch.cuda.synchronize(device)
-            decode_start = time.perf_counter()
             while len(ids) < max_length and ids[-1] not in stop_tokens:
                 with (comfy.model_prefetch.malloc_graph_scope(device) if compile_allocations else contextlib.nullcontext()):
                     accepts, commit = step()
-                decode_steps += 1
-                drafted_tokens += depth
-                accepted_drafts += accepts
                 commit = list(commit[:max_length - len(ids)])
                 stop = next((i for i, t in enumerate(commit) if t in stop_tokens), None)
                 if stop is not None:
@@ -1020,10 +1009,6 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                                 draft_capture()
                         probe = None
         finally:
-            if decode_start is not None:
-                torch.cuda.synchronize(device)
-                decode_elapsed = time.perf_counter() - decode_start
-                logging.info(f"Qwen MTP: {decode_steps} model sweeps in {decode_elapsed:.6f}s = {decode_steps / decode_elapsed:.3f} sweeps/s; {accepted_drafts}/{drafted_tokens} drafts accepted")
             console.close()
             drop_draft_graph()
             if pinned:
