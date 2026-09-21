@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import contextlib
+import logging
 import os
 import time
 import warnings
@@ -1022,7 +1023,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             if decode_start is not None:
                 torch.cuda.synchronize(device)
                 decode_elapsed = time.perf_counter() - decode_start
-                print(f"Qwen MTP: {decode_steps} model sweeps in {decode_elapsed:.6f}s = {decode_steps / decode_elapsed:.3f} sweeps/s; {accepted_drafts}/{drafted_tokens} drafts accepted")
+                logging.info(f"Qwen MTP: {decode_steps} model sweeps in {decode_elapsed:.6f}s = {decode_steps / decode_elapsed:.3f} sweeps/s; {accepted_drafts}/{drafted_tokens} drafts accepted")
             console.close()
             drop_draft_graph()
             if pinned:
