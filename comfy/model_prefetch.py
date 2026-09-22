@@ -88,22 +88,22 @@ def prefetch_ring_begin(module, device, past_key_values, enabled):
         module._compiled_prefetch_ring = ring
         PREFETCH_RING_MODULES.add(module)
     if ring.ready:
-        ring.configure()
+        if ACTIVE_PREFETCH_RING is not ring:
+            ring.configure()
+            ACTIVE_PREFETCH_RING = ring
     else:
+        if ACTIVE_PREFETCH_RING is not None:
+            ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
+            ACTIVE_PREFETCH_RING = None
         ck.set_prefetch_ring_recorder(ring.record)
-    ACTIVE_PREFETCH_RING = ring
     return ring
 
 
 def prefetch_ring_end(ring):
-    global ACTIVE_PREFETCH_RING
     if ring is None:
         return
-    if ring.ready:
-        ck.disable_prefetch_ring(ring.device)
-    else:
+    if not ring.ready:
         ring.finish_recording()
-    ACTIVE_PREFETCH_RING = None
 
 def _malloc_graph_break():
     global MALLOC_GRAPH_BREAKS
