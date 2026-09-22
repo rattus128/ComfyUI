@@ -995,6 +995,9 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
             if use_graph and len(ids) < max_length and ids[-1] not in stop_tokens:
                 draft_capture()
+            profiling = os.environ.get("QWEN_NSYS_CAPTURE") == "1"
+            if profiling:
+                torch.cuda.cudart().cudaProfilerStart()
             torch.cuda.synchronize(device)
             decode_start = time.perf_counter()
             while len(ids) < max_length and ids[-1] not in stop_tokens:
@@ -1031,6 +1034,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                         probe = None
             torch.cuda.synchronize(device)
             decode_elapsed = time.perf_counter() - decode_start
+            if profiling:
+                torch.cuda.cudart().cudaProfilerStop()
         finally:
             console.close()
             drop_draft_graph()
