@@ -450,6 +450,7 @@ class Qwen35Transformer(Llama2_):
         nn.Module.__init__(self)
         self.config = config
         self.prefetch_dynamic_vbars = True
+        self.prefetch_ring_enabled = True
         self.graph_dynamic_vbar_blocks = True
         self.vocab_size = config.vocab_size
         self.embed_tokens = ops.Embedding(config.vocab_size, config.hidden_size, device=device, dtype=dtype)

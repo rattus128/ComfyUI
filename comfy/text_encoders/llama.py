@@ -95,8 +95,12 @@ class FixedKVBias(FixedKV):
         key = self.key.reshape(batch_size * num_kv_heads, self.key.shape[2], head_dim)
         value = self.value.reshape(batch_size * num_kv_heads, self.value.shape[2], head_dim)
         bias = self.bias[..., self.bias.shape[-2] - seq:, :].unsqueeze(1)
+        comfy_kitchen.record_prefetch_region(self.key)
+        comfy_kitchen.step_prefetch_ring(xq.device)
         scores = torch.bmm(q, key.transpose(1, 2)).reshape(batch_size, num_kv_heads, groups, seq, -1).add_(bias)
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(xq.dtype)
+        comfy_kitchen.record_prefetch_region(self.value)
+        comfy_kitchen.step_prefetch_ring(xq.device)
         out = torch.bmm(probs.reshape(batch_size * num_kv_heads, groups * seq, -1), value)
         out = out.reshape(batch_size, num_kv_heads, groups, seq, head_dim)
         return out.permute(0, 3, 1, 2, 4).reshape(batch_size, seq, num_heads * head_dim)
@@ -969,6 +973,10 @@ class Llama2_(nn.Module):
             elif intermediate_output < 0:
                 intermediate_output = len(self.layers) + intermediate_output
 
+        prefetch_ring = comfy.model_prefetch.prefetch_ring_begin(
+            self, x.device, past_key_values,
+            enable_graph and getattr(self, "prefetch_ring_enabled", False),
+        )
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
         for i, layer in enumerate(self.layers):
@@ -1017,6 +1025,7 @@ class Llama2_(nn.Module):
             prefetch_queue, x.device, None,
             malloc_scope="block"
         )
+        comfy.model_prefetch.prefetch_ring_end(prefetch_ring)
 
         if self.norm is not None:
             x = self.norm(x)

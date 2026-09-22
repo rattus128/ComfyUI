@@ -20,6 +20,88 @@ MALLOC_GRAPHS = {}
 MALLOC_GRAPH_BREAKS = 0
 MALLOC_GRAPH_ROGUES = 0
 MALLOC_GRAPH_USED = False
+PREFETCH_RING_CAPACITY = 4096
+PREFETCH_RING_LOOKAHEAD = 64 * 1024 * 1024
+ACTIVE_PREFETCH_RING = None
+
+
+class CompiledPrefetchRing:
+    def __init__(self, device, cache_key):
+        self.device = device
+        self.cache_key = cache_key
+        self.entries = []
+        self.ready = False
+        with pause_malloc_graph(sync=True):
+            self.descriptors = torch.empty(
+                (PREFETCH_RING_CAPACITY, 2), device=device, dtype=torch.uint64
+            )
+
+    def record(self, tensor):
+        if not tensor.is_cuda or tensor.device != self.descriptors.device:
+            raise RuntimeError("prefetch ring region must be on the ring CUDA device")
+        if not tensor.is_contiguous():
+            raise RuntimeError("prefetch ring region must be contiguous")
+        if len(self.entries) == PREFETCH_RING_CAPACITY:
+            raise RuntimeError("prefetch ring descriptor capacity exceeded")
+        size = tensor.numel() * tensor.element_size()
+        if size:
+            self.entries.append((tensor.data_ptr(), size))
+
+    def finish_recording(self):
+        ck.set_prefetch_ring_recorder(None)
+        if not self.entries:
+            return
+        with pause_malloc_graph(sync=True):
+            host = torch.tensor(self.entries, dtype=torch.uint64)
+            self.descriptors[:len(self.entries)].copy_(host)
+        self.ready = True
+        logging.info(
+            "Comfy prefetch ring recorded %d regions (%.2f GiB)",
+            len(self.entries), sum(size for _, size in self.entries) / (1024 ** 3),
+        )
+
+    def configure(self):
+        ck.configure_prefetch_ring(
+            self.descriptors, len(self.entries), PREFETCH_RING_LOOKAHEAD
+        )
+
+
+def _prefetch_ring_cache_key(past_key_values):
+    key = []
+    for cache in past_key_values:
+        for name in ("key", "value", "recurrent_state", "conv_state"):
+            tensor = getattr(cache, name, None)
+            if tensor is not None:
+                key.append((tensor.data_ptr(), tensor.numel(), tensor.element_size()))
+    return tuple(key)
+
+
+def prefetch_ring_begin(module, device, past_key_values, enabled):
+    global ACTIVE_PREFETCH_RING
+    if not enabled or not hasattr(ck, "prefetch_ring_is_available") or not ck.prefetch_ring_is_available():
+        return None
+    cache_key = _prefetch_ring_cache_key(past_key_values)
+    ring = getattr(module, "_compiled_prefetch_ring", None)
+    if ring is None or ring.cache_key != cache_key:
+        ring = CompiledPrefetchRing(device, cache_key)
+        module._compiled_prefetch_ring = ring
+    if ring.ready:
+        ring.configure()
+    else:
+        ck.set_prefetch_ring_recorder(ring.record)
+    ACTIVE_PREFETCH_RING = ring
+    return ring
+
+
+def prefetch_ring_end(ring):
+    global ACTIVE_PREFETCH_RING
+    if ring is None:
+        return
+    if ring.ready:
+        ck.disable_prefetch_ring(ring.device)
+    else:
+        ring.finish_recording()
+    ACTIVE_PREFETCH_RING = None
 
 def _malloc_graph_break():
     global MALLOC_GRAPH_BREAKS
@@ -153,7 +235,13 @@ def cleanup_prefetch_queues():
     global MALLOC_GRAPH_BREAKS
     global MALLOC_GRAPH_ROGUES
     global MALLOC_GRAPH_USED
+    global ACTIVE_PREFETCH_RING
 
+    if hasattr(ck, "set_prefetch_ring_recorder"):
+        ck.set_prefetch_ring_recorder(None)
+    if ACTIVE_PREFETCH_RING is not None and ACTIVE_PREFETCH_RING.ready:
+        ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
+    ACTIVE_PREFETCH_RING = None
     cleanup_malloc_graph()
     for queue in PREFETCH_QUEUES:
         for entry in queue:
