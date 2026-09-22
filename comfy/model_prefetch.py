@@ -79,6 +79,7 @@ def _prefetch_ring_cache_key(past_key_values):
 
 def prefetch_ring_begin(module, device, past_key_values, enabled):
     global ACTIVE_PREFETCH_RING
+    return None
     if not enabled or not hasattr(ck, "prefetch_ring_is_available") or not ck.prefetch_ring_is_available():
         return None
     cache_key = _prefetch_ring_cache_key(past_key_values)
