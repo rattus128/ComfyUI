@@ -23,6 +23,7 @@ MALLOC_GRAPH_USED = False
 PREFETCH_RING_CAPACITY = 4096
 PREFETCH_RING_LOOKAHEAD = 64 * 1024 * 1024
 ACTIVE_PREFETCH_RING = None
+PREFETCH_RING_MODULES = weakref.WeakSet()
 
 
 class CompiledPrefetchRing:
@@ -85,6 +86,7 @@ def prefetch_ring_begin(module, device, past_key_values, enabled):
     if ring is None or ring.cache_key != cache_key:
         ring = CompiledPrefetchRing(device, cache_key)
         module._compiled_prefetch_ring = ring
+        PREFETCH_RING_MODULES.add(module)
     if ring.ready:
         ring.configure()
     else:
@@ -242,6 +244,9 @@ def cleanup_prefetch_queues():
     if ACTIVE_PREFETCH_RING is not None and ACTIVE_PREFETCH_RING.ready:
         ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
     ACTIVE_PREFETCH_RING = None
+    for module in PREFETCH_RING_MODULES:
+        if hasattr(module, "_compiled_prefetch_ring"):
+            del module._compiled_prefetch_ring
     cleanup_malloc_graph()
     for queue in PREFETCH_QUEUES:
         for entry in queue:
