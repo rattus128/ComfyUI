@@ -247,10 +247,8 @@ class GatedDeltaNet(nn.Module):
                     w_a = w_a.dequantize()
                 if isinstance(w_b, QuantizedTensor):
                     w_b = w_b.dequantize()
-                gate_a = F.linear(x, w_a)
-                gate_b = F.linear(x, w_b)
                 core_attn_out = comfy_kitchen.gated_delta_decode_fused(
-                    conv_out, gate_a, gate_b, past_key_value.dt_bias, past_key_value.g_decay, past_key_value.recurrent_state,
+                    conv_out, x, w_a, w_b, past_key_value.dt_bias, past_key_value.g_decay, past_key_value.recurrent_state,
                     self.key_dim, self.num_key_heads, self.key_head_dim ** -0.5, z, past_key_value.norm_weight, self.norm.eps,
                     past_key_value.snap_backing[:seq_len - 1] if seq_len > 1 else None)
             return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1)), past_key_value
