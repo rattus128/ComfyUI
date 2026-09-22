@@ -982,6 +982,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             return accepts, commit
 
         probe = None if fixed_depth is not None else [0, 0]  # steps, accepted drafts
+        self.model.prefetch_ring_enabled = probe is None
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
@@ -1009,7 +1010,9 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                             if use_graph:
                                 draft_capture()
                         probe = None
+                        self.model.prefetch_ring_enabled = True
         finally:
+            self.model.prefetch_ring_enabled = True
             console.close()
             drop_draft_graph()
             if pinned:

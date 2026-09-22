@@ -244,9 +244,8 @@ def cleanup_prefetch_queues():
     if ACTIVE_PREFETCH_RING is not None and ACTIVE_PREFETCH_RING.ready:
         ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
     ACTIVE_PREFETCH_RING = None
-    for module in PREFETCH_RING_MODULES:
-        if hasattr(module, "_compiled_prefetch_ring"):
-            del module._compiled_prefetch_ring
+    if PREFETCH_RING_MODULES:
+        comfy.model_management.synchronize()
     cleanup_malloc_graph()
     for queue in PREFETCH_QUEUES:
         for entry in queue:
@@ -256,6 +255,9 @@ def cleanup_prefetch_queues():
             prefetched_module, comfy_modules = prefetch_state
             if comfy_modules is not None:
                 cleanup_prefetched_modules(prefetched_module, comfy_modules)
+    for module in PREFETCH_RING_MODULES:
+        if hasattr(module, "_compiled_prefetch_ring"):
+            del module._compiled_prefetch_ring
     PREFETCH_QUEUES = []
     GRAPH_WARMED_MODULES.clear()
     if MALLOC_GRAPH_USED:
