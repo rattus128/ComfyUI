@@ -444,5 +444,39 @@ class TestMixedPrecisionOps(unittest.TestCase):
         self.assertEqual(saved_conf["linear_dtype"], "int8")
         self.assertNotIn("quant_group_size", saved_conf)
 
+    def test_w4a8_mma_packed_checkpoint_loads_without_separate_group_scales(self):
+        if "asym_w4a8_int8" not in QUANT_ALGOS:
+            self.skipTest("comfy_kitchen does not provide W4A8")
+
+        n, k = 16, 256
+        quant_conf = {
+            "format": "asym_w4a8_int8",
+            "group_size": 16,
+            "convrot_groupsize": 256,
+            "mma_packed": True,
+        }
+        state_dict = {
+            "layer.weight": torch.randint(
+                -128, 128, (n * k * 9 // 16,), dtype=torch.int8
+            ),
+            "layer.weight_s_channel": torch.ones(n, dtype=torch.float32),
+            "layer.weight_codebook": torch.linspace(-1, 1, 16),
+            "layer.comfy_quant": torch.tensor(
+                list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8
+            ),
+        }
+        model = torch.nn.Module()
+        model.layer = ops.mixed_precision_ops({}).Linear(
+            k, n, bias=False, device="cpu", dtype=torch.bfloat16
+        )
+        model.load_state_dict(state_dict, strict=False)
+
+        self.assertIsInstance(model.layer.weight, QuantizedTensor)
+        self.assertTrue(model.layer.weight._params.mma_packed)
+        self.assertEqual(model.layer.weight._params.scale.numel(), 0)
+        self.assertEqual(model.layer.weight._qdata.shape, (n * k * 9 // 16,))
+        saved_conf = json.loads(model.state_dict()["layer.comfy_quant"].numpy().tobytes())
+        self.assertTrue(saved_conf["mma_packed"])
+
 if __name__ == "__main__":
     unittest.main()
