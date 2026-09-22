@@ -1271,6 +1271,7 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
                     layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))
                 ),
                 "mma_packed": mma_packed,
+                "mma_rows": int(layer_conf.get("mma_rows", params_conf.get("mma_rows", 16))),
             }
         else:
             raise ValueError(f"Unsupported quantization format: {module.quant_format}")
@@ -1328,6 +1329,7 @@ def _quantized_weight_state_dict(module, sd, prefix, extra_quant_conf=None, extr
             quant_conf["convrot_groupsize"] = getattr(params, "convrot_groupsize", 256)
             if getattr(params, "mma_packed", False):
                 quant_conf["mma_packed"] = True
+                quant_conf["mma_rows"] = getattr(params, "mma_rows", 16)
         if extra_quant_conf:
             quant_conf.update(extra_quant_conf)
         sd[f"{prefix}comfy_quant"] = torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8)
