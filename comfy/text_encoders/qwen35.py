@@ -4,7 +4,9 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import contextlib
+import logging
 import os
+import time
 import warnings
 
 import comfy.model_management
@@ -17,6 +19,8 @@ from comfy import sd1_clip
 import comfy.text_encoders.qwen_vl
 
 from .llama import BaseLlama, BaseGenerate, FixedKV, FixedKVBias, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -941,31 +945,34 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             nonlocal pos
             drafts = []
             tok_in, hid_in = nt_buf, h_buf
-            for k in range(depth):
-                dk, rk = draft(tok_in, hid_in, pos + k)
-                if k < depth - 1:
-                    dk = dk.clone()  # later replays overwrite the static output
-                drafts.append(dk)
-                tok_in, hid_in = dk, rk
+            with torch.cuda.nvtx.range("qwen_mtp_drafts"):
+                for k in range(depth):
+                    dk, rk = draft(tok_in, hid_in, pos + k)
+                    if k < depth - 1:
+                        dk = dk.clone()  # later replays overwrite the static output
+                    drafts.append(dk)
+                    tok_in, hid_in = dk, rk
             ev = self.model.embed_tokens(torch.cat([nt_buf] + drafts, dim=1)).to(dt)
-            x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers)
+            with torch.cuda.nvtx.range("qwen_main_transformer_sweep"):
+                x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers)
             # all verify positions in one lm_head GEMV, accept decided GPU-side, one sync
-            lg = verify_logits(x)
-            if sampling is None:
-                toks = lg.argmax(dim=-1)
-                vals = torch.cat([toks[0]] + [d[0] for d in drafts]).tolist()
-                t, dr = vals[:depth + 1], vals[depth + 1:]
-                accepts = 0
-                while accepts < depth and t[accepts] == dr[accepts]:
-                    accepts += 1
-                next_toks = tuple(toks[:, i:i + 1] for i in range(depth + 1))
-                commit = tuple(dr[:accepts]) + (t[accepts],)
-            else:
-                dr, corr, accepted = verify_sample(lg, drafts)
-                vals = torch.cat([dr[:, 0], corr[:, 0], accepted.reshape(1)]).tolist()
-                dr, cv, accepts = vals[:depth], vals[depth:2 * depth + 1], vals[-1]
-                next_toks = tuple(corr[i:i + 1] for i in range(depth + 1))
-                commit = tuple(dr[:accepts]) + (cv[accepts],)
+            with torch.cuda.nvtx.range("qwen_mtp_verify"):
+                lg = verify_logits(x)
+                if sampling is None:
+                    toks = lg.argmax(dim=-1)
+                    vals = torch.cat([toks[0]] + [d[0] for d in drafts]).tolist()
+                    t, dr = vals[:depth + 1], vals[depth + 1:]
+                    accepts = 0
+                    while accepts < depth and t[accepts] == dr[accepts]:
+                        accepts += 1
+                    next_toks = tuple(toks[:, i:i + 1] for i in range(depth + 1))
+                    commit = tuple(dr[:accepts]) + (t[accepts],)
+                else:
+                    dr, corr, accepted = verify_sample(lg, drafts)
+                    vals = torch.cat([dr[:, 0], corr[:, 0], accepted.reshape(1)]).tolist()
+                    dr, cv, accepts = vals[:depth], vals[depth:2 * depth + 1], vals[-1]
+                    next_toks = tuple(corr[i:i + 1] for i in range(depth + 1))
+                    commit = tuple(dr[:accepts]) + (cv[accepts],)
             if accepts < depth:
                 for kv in pkv:
                     kv.rollback(depth - accepts)
@@ -981,19 +988,33 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             return accepts, commit
 
         probe = None if fixed_depth is not None else [0, 0]  # steps, accepted drafts
+        sweeps = drafted = accepted = committed = 0
+        depth_stats = {}
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
             if use_graph and len(ids) < max_length and ids[-1] not in stop_tokens:
                 draft_capture()
+            torch.cuda.synchronize(device)
+            decode_start = time.perf_counter()
             while len(ids) < max_length and ids[-1] not in stop_tokens:
+                step_depth = depth
                 with (comfy.model_prefetch.malloc_graph_scope(device) if compile_allocations else contextlib.nullcontext()):
-                    accepts, commit = step()
+                    with torch.cuda.nvtx.range("qwen_mtp_decode_step"):
+                        accepts, commit = step()
+                sweeps += 1
+                drafted += step_depth
+                accepted += accepts
+                stats = depth_stats.setdefault(step_depth, [0, 0, 0])
+                stats[0] += 1
+                stats[1] += step_depth
+                stats[2] += accepts
                 commit = list(commit[:max_length - len(ids)])
                 stop = next((i for i, t in enumerate(commit) if t in stop_tokens), None)
                 if stop is not None:
                     del commit[stop + 1:]
                 ids.extend(commit)
+                committed += len(commit)
                 update_progress(len(commit))
                 if probe is not None:
                     probe[0] += 1
@@ -1008,11 +1029,23 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                             if use_graph:
                                 draft_capture()
                         probe = None
+            torch.cuda.synchronize(device)
+            decode_elapsed = time.perf_counter() - decode_start
         finally:
             console.close()
             drop_draft_graph()
             if pinned:
                 comfy.model_prefetch.cleanup_prefetched_modules(None, pinned)
+        depth_summary = ", ".join(
+            f"depth {d}: {stats[0]} sweeps, {stats[2]}/{stats[1]} accepted"
+            for d, stats in sorted(depth_stats.items())
+        )
+        logger.info(
+            "Qwen MTP decode: %d transformer sweeps in %.3fs (%.2f sweeps/s), "
+            "%d/%d drafts accepted (%.2f%%), %d tokens committed (%.3f tokens/sweep); %s",
+            sweeps, decode_elapsed, sweeps / decode_elapsed, accepted, drafted,
+            100.0 * accepted / drafted, committed, committed / sweeps, depth_summary,
+        )
         return ids
 
     def init_kv_cache(self, batch, max_cache_len, device, execution_dtype):
