@@ -91,11 +91,14 @@ class FixedKVBias(FixedKV):
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
         groups = num_heads // num_kv_heads
-        q = xq.reshape(batch_size, num_kv_heads, groups, seq, head_dim) * head_dim ** -0.5
+        q = xq.reshape(batch_size * num_kv_heads, groups * seq, head_dim) * head_dim ** -0.5
+        key = self.key.reshape(batch_size * num_kv_heads, self.key.shape[2], head_dim)
+        value = self.value.reshape(batch_size * num_kv_heads, self.value.shape[2], head_dim)
         bias = self.bias[..., self.bias.shape[-2] - seq:, :].unsqueeze(1)
-        scores = (q @ self.key.transpose(-1, -2).unsqueeze(2)).add_(bias)
+        scores = torch.bmm(q, key.transpose(1, 2)).reshape(batch_size, num_kv_heads, groups, seq, -1).add_(bias)
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(xq.dtype)
-        out = probs @ self.value.unsqueeze(2)
+        out = torch.bmm(probs.reshape(batch_size * num_kv_heads, groups * seq, -1), value)
+        out = out.reshape(batch_size, num_kv_heads, groups, seq, head_dim)
         return out.permute(0, 3, 1, 2, 4).reshape(batch_size, seq, num_heads * head_dim)
 
 @dataclass
