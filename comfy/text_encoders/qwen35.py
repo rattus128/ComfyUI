@@ -59,7 +59,7 @@ def detect_merged_config(state_dict):
     return {
         "merged_qkv": "model.layers.3.self_attn.qkv_proj.weight" in state_dict,
         "merged_mlp": "model.layers.0.mlp.gate_up_proj.weight" in state_dict,
-        "merged_delta_qkvz": "model.layers.0.self_attn.in_proj_qkvz.weight" in state_dict,
+        "merged_delta_qkvz": "model.layers.0.linear_attn.in_proj_qkvz.weight" in state_dict,
     }
 
 @dataclass
