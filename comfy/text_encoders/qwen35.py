@@ -767,9 +767,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                         "repetition_penalty": repetition_penalty,
                         "presence_penalty": kwargs.get("presence_penalty", 0.0) or 0.0,
                         "seed": seed if seed is not None else 42}
-        # Greedy auto-MTP always promoted to depth 5 after its probe. Starting there
-        # avoids tearing down and recapturing its CUDA graphs mid-generation.
-        fixed_depth = (5 if sampling is None else None) if mtp is True else max(2, min(5, int(mtp)))
+        fixed_depth = None if mtp is True else max(2, min(5, int(mtp)))
         return self._generate_mtp(embeds, max_length, stop_tokens, sampling=sampling, fixed_depth=fixed_depth)
 
     def _generate_mtp(self, embeds, max_length, stop_tokens, sampling=None, fixed_depth=None):
@@ -984,7 +982,6 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             return accepts, commit
 
         probe = None if fixed_depth is not None else [0, 0]  # steps, accepted drafts
-        self.model.prefetch_ring_enabled = False
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
@@ -1012,9 +1009,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                             if use_graph:
                                 draft_capture()
                         probe = None
-                        self.model.prefetch_ring_enabled = True
         finally:
-            self.model.prefetch_ring_enabled = True
             console.close()
             drop_draft_graph()
             if pinned:
