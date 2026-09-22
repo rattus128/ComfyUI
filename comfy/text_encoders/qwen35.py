@@ -59,6 +59,7 @@ def detect_merged_config(state_dict):
     return {
         "merged_qkv": "model.layers.3.self_attn.qkv_proj.weight" in state_dict,
         "merged_mlp": "model.layers.0.mlp.gate_up_proj.weight" in state_dict,
+        "merged_delta_qkvz": "model.layers.0.self_attn.in_proj_qkvz.weight" in state_dict,
     }
 
 @dataclass
@@ -97,6 +98,7 @@ class Qwen35Config:
     mtp: bool = False
     merged_qkv: bool = False
     merged_mlp: bool = False
+    merged_delta_qkvz: bool = False
 
 QWEN35_VISION_DEFAULTS = dict(hidden_size=1024, num_heads=16, intermediate_size=4096, depth=24, patch_size=16, temporal_patch_size=2, in_channels=3, spatial_merge_size=2, num_position_embeddings=2304)
 
@@ -203,8 +205,12 @@ class GatedDeltaNet(nn.Module):
         self.value_dim = value_dim
         conv_dim = key_dim * 2 + value_dim
 
-        self.in_proj_qkv = ops.Linear(hidden, conv_dim, bias=False, device=device, dtype=dtype)
-        self.in_proj_z = ops.Linear(hidden, value_dim, bias=False, device=device, dtype=dtype)
+        self.merged_qkvz = config.merged_delta_qkvz
+        if self.merged_qkvz:
+            self.in_proj_qkvz = ops.Linear(hidden, conv_dim + value_dim, bias=False, device=device, dtype=dtype)
+        else:
+            self.in_proj_qkv = ops.Linear(hidden, conv_dim, bias=False, device=device, dtype=dtype)
+            self.in_proj_z = ops.Linear(hidden, value_dim, bias=False, device=device, dtype=dtype)
         self.in_proj_b = ops.Linear(hidden, self.num_value_heads, bias=False, device=device, dtype=dtype)
         self.in_proj_a = ops.Linear(hidden, self.num_value_heads, bias=False, device=device, dtype=dtype)
         self.out_proj = ops.Linear(value_dim, hidden, bias=False, device=device, dtype=dtype)
@@ -231,8 +237,11 @@ class GatedDeltaNet(nn.Module):
                      and (seq_len == 1 or past_key_value.snap_backing is not None))
 
         # Projections (shared)
-        proj = self.in_proj_qkv(x)  # [B, seq_len, conv_dim]
-        z = self.in_proj_z(x)
+        if self.merged_qkvz:
+            proj, z = self.in_proj_qkvz(x).split([self.key_dim * 2 + self.value_dim, self.value_dim], dim=-1)
+        else:
+            proj = self.in_proj_qkv(x)  # [B, seq_len, conv_dim]
+            z = self.in_proj_z(x)
 
         if use_fused:
             # decode: kitchen conv step, then gates + delta rule + gated norm in one kernel
