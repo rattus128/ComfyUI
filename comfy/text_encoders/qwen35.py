@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import contextlib
+import logging
 import os
 import warnings
 
@@ -1049,6 +1050,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             return accepts, commit
 
         probe = None if fixed_depth is not None else [0, 0]  # steps, accepted drafts
+        accept_hist = [0] * 6  # steps by number of accepted drafts
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
@@ -1063,6 +1065,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                     del commit[stop + 1:]
                 ids.extend(commit)
                 update_progress(len(commit))
+                accept_hist[accepts] += 1
                 if probe is not None:
                     probe[0] += 1
                     probe[1] += accepts
@@ -1078,6 +1081,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                         probe = None
         finally:
             console.close()
+            logging.debug("mtp depth %d: %d steps, accepted-draft histogram %s", depth, sum(accept_hist), accept_hist)
             drop_draft_graph()
             if pinned:
                 comfy.model_prefetch.cleanup_prefetched_modules(None, pinned)
