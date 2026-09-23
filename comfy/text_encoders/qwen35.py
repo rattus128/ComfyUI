@@ -459,7 +459,8 @@ class Qwen35Transformer(Llama2_):
         nn.Module.__init__(self)
         self.config = config
         self.prefetch_dynamic_vbars = True
-        self.prefetch_ring_enabled = True
+        # A/B test scaffold: COMFY_PREFETCH_RING=0 disables the ring
+        self.prefetch_ring_enabled = os.environ.get("COMFY_PREFETCH_RING", "1") != "0"
         self.graph_dynamic_vbar_blocks = True
         self.vocab_size = config.vocab_size
         self.embed_tokens = ops.Embedding(config.vocab_size, config.hidden_size, device=device, dtype=dtype)
