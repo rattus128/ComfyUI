@@ -1072,19 +1072,19 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 accept_hist[accepts] += 1
                 if probe is not None and sum(accept_hist) == probe:
                     probe = None
-                    # survival of draft positions 2 and 3; positions 4-5 extrapolated geometrically
+                    # survival of draft positions 2 and 3 (measured: position 4 survives ~1/3 as
+                    # often as position 3, so 5 deep needs position 3 to survive most steps)
                     steps = sum(accept_hist)
                     s2 = sum(accept_hist[2:]) / steps
                     s3 = sum(accept_hist[3:]) / steps
-                    s4 = s3 * s3 / s2 if s2 > 0 else 0.0
-                    if sampling is None and s3 >= DRAFT_SURVIVAL and s4 >= DRAFT_SURVIVAL and max_length - len(ids) > 512:
+                    if sampling is None and s3 >= 0.5 and max_length - len(ids) > 512:
                         new_depth = 5
                     elif s3 >= DRAFT_SURVIVAL:
                         new_depth = 3
                     else:
                         new_depth = 2
                     if new_depth != depth and (new_depth < depth or new_depth * snapshot_bytes < comfy.model_management.get_free_memory(device)):
-                        logging.debug("mtp probe: survival %.2f/%.2f (position 4 est %.2f), depth %d -> %d", s2, s3, s4, depth, new_depth)
+                        logging.debug("mtp probe: survival %.2f/%.2f, depth %d -> %d", s2, s3, depth, new_depth)
                         comfy.model_prefetch.cleanup_prefetch_queues()
                         drop_draft_graph()
                         set_depth(new_depth)
