@@ -48,6 +48,8 @@ class CompiledPrefetchRing:
         if len(self.entries) == PREFETCH_RING_CAPACITY:
             raise RuntimeError("prefetch ring descriptor capacity exceeded")
         size = tensor.numel() * tensor.element_size()
+        if tensor.data_ptr() % 16 or size % 16:
+            raise RuntimeError("prefetch ring region must be 16-byte aligned (issuer uses 16-byte loads)")
         if size:
             self.entries.append((tensor.data_ptr(), size))
 
