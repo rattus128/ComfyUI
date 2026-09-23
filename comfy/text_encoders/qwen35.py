@@ -24,21 +24,48 @@ class LinearKV(FixedKV):
     # DeltaNet state on the FixedKV interface: key=conv_state, value=recurrent_state (fp32)
     g_decay: torch.Tensor = None
     dt_bias: torch.Tensor = None
-    snapshots: list = None  # [(recurrent, conv)] taken after step 1, 2, ... of the last verify
+    snapshots: list = None  # eager fallback: [(recurrent, conv)] taken after step 1, 2, ... of the last verify
     last_seq: int = 1
     snap_backing: torch.Tensor = None
     conv_snap_backing: torch.Tensor = None
     norm_weight: torch.Tensor = None
+    # deferred commit (kitchen sm_90+): a decode step never writes state; the next
+    # step replays the ctl[0] still-accepted tokens from the [1 - ctl[1]] side
+    # buffers and commits them. ctl and the host tracker are shared across layers.
+    qkv_buf: torch.Tensor = None
+    proj_buf: torch.Tensor = None
+    gates_buf: torch.Tensor = None
+    sumsq_buf: torch.Tensor = None
+    ctl: torch.Tensor = None  # int32 device {pending, parity}
+    ctl_tracker: dict = None  # {"host": pinned int32 [2, 2], "step": last (index, num_tokens) written}
+    uncommitted: int = 0  # tokens of the last deferred step still to commit (rollback trims it)
+
+    @staticmethod
+    def deferred_tracker(device):
+        return {"ctl": torch.zeros((2,), dtype=torch.int32, device=device),
+                "host": torch.zeros((2, 2), dtype=torch.int32).pin_memory(), "step": None, "parity": 0}
 
     def prepare(self, num_tokens):
-        pass
+        # once per step (the first linear layer): tell this step's kernels what to replay
+        t = self.ctl_tracker
+        if t is None or t["step"] == (self.index, num_tokens):
+            return
+        t["step"] = (self.index, num_tokens)
+        t["parity"] ^= 1
+        host = t["host"][t["parity"]]
+        host[0] = self.uncommitted
+        host[1] = t["parity"]
+        self.ctl.copy_(host, non_blocking=True)
 
     def rollback(self, discard=1):
+        self.index -= discard
+        if self.ctl is not None:
+            self.uncommitted -= discard  # nothing was written; the next step replays fewer tokens
+            return
         # discard the rejected tail: restore the snapshot taken after the last kept token
         rec, conv = self.snapshots[self.last_seq - discard - 1]
         self.recurrent_state.copy_(rec)
         self.conv_state.copy_(conv)
-        self.index -= discard
 
     @property
     def conv_state(self):
@@ -232,8 +259,10 @@ class GatedDeltaNet(nn.Module):
             and seq_len <= 6
         )
 
+        use_deferred = use_recurrent and past_key_value.ctl is not None
         fused_available = getattr(comfy_kitchen, "gated_delta_decode_is_available", None)
-        use_fused = (use_recurrent and fused_available is not None and fused_available(x.device, self.key_head_dim, self.value_head_dim)
+        use_fused = (use_recurrent and not use_deferred and fused_available is not None
+                     and fused_available(x.device, self.key_head_dim, self.value_head_dim)
                      and (seq_len == 1 or past_key_value.snap_backing is not None))
 
         # Projections (shared)
@@ -242,6 +271,25 @@ class GatedDeltaNet(nn.Module):
         else:
             proj = self.in_proj_qkv(x)  # [B, seq_len, conv_dim]
             z = self.in_proj_z(x)
+
+        if use_deferred:
+            # decode: conv step into the side buffer, then gates + delta rule + gated norm
+            # in one kernel; both commit the previous step's accepted tokens first
+            kv = past_key_value
+            kv.uncommitted = seq_len
+            with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (conv_weight, conv_bias):
+                comfy_kitchen.deltanet_conv_step_deferred(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
+            with comfy.ops.CastBiasWeightContext(self.in_proj_a, x, offloadable=True) as (w_a, _), \
+                 comfy.ops.CastBiasWeightContext(self.in_proj_b, x, offloadable=True) as (w_b, _):
+                if isinstance(w_a, QuantizedTensor):
+                    w_a = w_a.dequantize()
+                if isinstance(w_b, QuantizedTensor):
+                    w_b = w_b.dequantize()
+                core_attn_out = comfy_kitchen.gated_delta_decode_deferred(
+                    x, w_a, w_b, kv.dt_bias, kv.g_decay, kv.recurrent_state,
+                    self.key_dim, self.num_key_heads, self.key_head_dim ** -0.5, z, kv.norm_weight, self.norm.eps,
+                    kv.qkv_buf, kv.gates_buf, kv.sumsq_buf, kv.ctl)
+            return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1)), past_key_value
 
         if use_fused:
             # decode: kitchen conv step, then gates + delta rule + gated norm in one kernel
@@ -262,6 +310,8 @@ class GatedDeltaNet(nn.Module):
                     past_key_value.snap_backing[:seq_len - 1] if seq_len > 1 else None)
             return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1)), past_key_value
 
+        if past_key_value is not None:
+            past_key_value.uncommitted = 0  # this path writes the state directly
         mixed_qkv = proj.transpose(1, 2)  # [B, conv_dim, seq_len]
         b = self.in_proj_b(x)
         a = self.in_proj_a(x)
@@ -858,7 +908,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             nonlocal depth, verify_buffers
             depth = d
             for kv in pkv:
-                if isinstance(kv, LinearKV):
+                if isinstance(kv, LinearKV) and kv.ctl is None:
                     # snapshot views share one backing slab so the fused kernel can write them
                     kv.snap_backing = torch.empty((d,) + tuple(kv.recurrent_state.shape), device=device, dtype=torch.float32)
                     kv.conv_snap_backing = torch.empty((d,) + tuple(kv.conv_state.shape), device=device, dtype=kv.conv_state.dtype)
@@ -1037,6 +1087,10 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         model_config = self.model.config
         past_key_values = []
         shared = FixedKVBias.shared(batch, max_cache_len, model_config.head_dim, device, execution_dtype)
+        deferred_available = getattr(comfy_kitchen, "gated_delta_deferred_is_available", None)
+        tracker = None
+        if deferred_available is not None and deferred_available(device, model_config.linear_key_head_dim, model_config.linear_value_head_dim):
+            tracker = LinearKV.deferred_tracker(device)
         for i in range(model_config.num_hidden_layers):
             if model_config.layer_types[i] == "linear_attention":
                 recurrent_state = torch.zeros(
@@ -1048,7 +1102,12 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                     [batch, conv_dim, model_config.conv_kernel_size - 1],
                     device=device, dtype=execution_dtype
                 )
-                past_key_values.append(LinearKV(conv_state, recurrent_state, 0, None, None))
+                kv = LinearKV(conv_state, recurrent_state, 0, None, None)
+                if tracker is not None:
+                    kv.qkv_buf, kv.proj_buf, kv.gates_buf, kv.sumsq_buf = comfy_kitchen.gated_delta_deferred_buffers(
+                        batch, conv_dim, model_config.linear_num_value_heads, model_config.linear_num_key_heads, execution_dtype, device)
+                    kv.ctl, kv.ctl_tracker = tracker["ctl"], tracker
+                past_key_values.append(kv)
             else:
                 past_key_values.append(FixedKVBias.zeros(batch, model_config.num_key_value_heads, max_cache_len, model_config.head_dim, device, execution_dtype, shared))
         return past_key_values
