@@ -351,6 +351,10 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
                     graph.register_generator_state(generator)
                 malloc_graph.resume()
                 # Capture-time VBAR eviction is safe after prior work completes.
+                # The device sync would deadlock against a polling ring issuer
+                # waiting on this stream, so stop it for the rest of the step.
+                if ACTIVE_PREFETCH_RING is not None:
+                    ck.disable_prefetch_ring(device)
                 comfy.model_management.synchronize()
                 capture_stream.wait_stream(comfy.model_management.current_stream(device))
                 malloc_graph.pause(sync=True)
