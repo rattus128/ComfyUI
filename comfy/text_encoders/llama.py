@@ -38,7 +38,9 @@ class FixedKV:
 
 @dataclass
 class FixedKVBias(FixedKV):
-    # full-capacity decode bias [1, 1, rows, capacity], last `seq` rows serve the queries; shared across layers
+    # full-capacity decode, position/seqlen/bias/tracker shared across layers. With the kitchen GQA
+    # decode kernel `seqlen` (device kv length) masks the tail; otherwise the additive bias
+    # [1, 1, rows, capacity] masks the bmm path, its last `seq` rows serving the queries.
     bias: torch.Tensor = None
     tracker: dict = None
 
@@ -47,37 +49,43 @@ class FixedKVBias(FixedKV):
             return
         self.tracker["step"] = (self.index, num_tokens)
         i = self.index
-        rows = self.bias.shape[-2]
+        rows = self.position.shape[0]
         if num_tokens <= rows:
             torch.arange(i, i + rows, out=self.position)
+            if self.bias is None:
+                self.seqlen.fill_(i + num_tokens)
+                return
             window = self.tracker[num_tokens]
             start = i - rows + 1
             skip = max(-start, 0)
             end = min(i + rows, self.bias.shape[-1])
             self.bias[..., :, start + skip:end] = window[:, skip:end - start]
-        else:
+        elif self.bias is not None:
             self.bias[..., :, i:i + num_tokens] = 0
 
     @staticmethod
-    def shared(capacity, device, dtype):
-        # all layers advance in lockstep, so the bias caches share one position/bias/tracker
+    def shared(batch, capacity, head_dim, device, dtype):
+        # all layers advance in lockstep, so the bias caches share one position/seqlen/bias/tracker
         rows = 6
         position = torch.empty((rows,), device=device, dtype=torch.int64)
-        bias = torch.full((1, 1, rows, capacity), torch.finfo(dtype).min, device=device, dtype=dtype)
         tracker = {"step": -1}
+        flash = getattr(comfy_kitchen, "flash_attention_decode_gqa_is_available", None)
+        if head_dim == 256 and flash is not None and flash(device):
+            return position, torch.zeros((batch,), device=device, dtype=torch.int32), None, tracker
+        bias = torch.full((1, 1, rows, capacity), torch.finfo(dtype).min, device=device, dtype=dtype)
         # window templates per decode width: row r serves query j = r - (rows - n) and may see slots <= index + j
         for n in range(1, rows + 1):
             window = torch.full((rows, 2 * rows - 1), torch.finfo(dtype).min, device=device, dtype=dtype)
             for r in range(rows):
                 window[r, :rows + max(r - (rows - n), 0)] = 0
             tracker[n] = window
-        return position, bias, tracker
+        return position, None, bias, tracker
 
     @classmethod
     def zeros(cls, batch, kv_heads, capacity, head_dim, device, dtype, shared):
         # zero-init: decode attends full capacity with masked tails, 0*0 stays finite
         key = torch.zeros((batch, kv_heads, capacity, head_dim), device=device, dtype=dtype)
-        return cls(key, torch.zeros_like(key), 0, shared[0], None, shared[1], shared[2])
+        return cls(key, torch.zeros_like(key), 0, *shared)
 
     def append(self, xk, xv):
         seq = xk.shape[2]
@@ -90,6 +98,8 @@ class FixedKVBias(FixedKV):
         batch_size, num_heads, seq, head_dim = xq.shape
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
+        if self.bias is None:
+            return comfy_kitchen.flash_attention_decode_gqa(xq, self.key, self.value, self.seqlen)
         groups = num_heads // num_kv_heads
         q = xq.reshape(batch_size * num_kv_heads, groups * seq, head_dim) * head_dim ** -0.5
         key = self.key.reshape(batch_size * num_kv_heads, self.key.shape[2], head_dim)
