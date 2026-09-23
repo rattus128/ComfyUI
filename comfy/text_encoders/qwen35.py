@@ -847,7 +847,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         embeds = embeds.to(dt)
         if embeds.ndim == 2:
             embeds = embeds.unsqueeze(0)
-        # greedy drafts 3 deep (5 after the probe); sampled stays at 2
+        # greedy probes 3 deep, then settles at 2, 3 or 5 by measured draft survival; sampled stays at 2
         depth = fixed_depth if fixed_depth is not None else (3 if sampling is None else 2)
         cap = embeds.shape[1] + max_length + 7
         pkv = self.init_kv_cache(embeds.shape[0], cap, device, dt)
@@ -1049,7 +1049,11 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             pos += accepts + 1
             return accepts, commit
 
-        probe = None if fixed_depth is not None else [0, 0]  # steps, accepted drafts
+        # A draft costs one MTP block plus one lm_head read (~1.6 GB here against ~14 GB for
+        # the verify sweep), so draft position k only pays when it survives verification in
+        # at least ~8% of steps for each token per step it adds: threshold DRAFT_SURVIVAL.
+        DRAFT_SURVIVAL = 0.15
+        probe = None if fixed_depth is not None else 64  # steps of the depth-3 probe
         accept_hist = [0] * 6  # steps by number of accepted drafts
         try:
             if pinned:
@@ -1066,19 +1070,26 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 ids.extend(commit)
                 update_progress(len(commit))
                 accept_hist[accepts] += 1
-                if probe is not None:
-                    probe[0] += 1
-                    probe[1] += accepts
-                    if probe[0] == 32:
-                        # deepen once acceptance sustains it and a recapture round can amortize
-                        if (sampling is None and max_length - len(ids) > 512 and 1 + probe[1] / probe[0] >= 2.2
-                                and 5 * snapshot_bytes < comfy.model_management.get_free_memory(device)):
-                            comfy.model_prefetch.cleanup_prefetch_queues()
-                            drop_draft_graph()
-                            set_depth(5)
-                            if use_graph:
-                                draft_capture()
-                        probe = None
+                if probe is not None and sum(accept_hist) == probe:
+                    probe = None
+                    # survival of draft positions 2 and 3; positions 4-5 extrapolated geometrically
+                    steps = sum(accept_hist)
+                    s2 = sum(accept_hist[2:]) / steps
+                    s3 = sum(accept_hist[3:]) / steps
+                    s4 = s3 * s3 / s2 if s2 > 0 else 0.0
+                    if sampling is None and s3 >= DRAFT_SURVIVAL and s4 >= DRAFT_SURVIVAL and max_length - len(ids) > 512:
+                        new_depth = 5
+                    elif s3 >= DRAFT_SURVIVAL:
+                        new_depth = 3
+                    else:
+                        new_depth = 2
+                    if new_depth != depth and (new_depth < depth or new_depth * snapshot_bytes < comfy.model_management.get_free_memory(device)):
+                        logging.debug("mtp probe: survival %.2f/%.2f (position 4 est %.2f), depth %d -> %d", s2, s3, s4, depth, new_depth)
+                        comfy.model_prefetch.cleanup_prefetch_queues()
+                        drop_draft_graph()
+                        set_depth(new_depth)
+                        if use_graph:
+                            draft_capture()
         finally:
             console.close()
             logging.debug("mtp depth %d: %d steps, accepted-draft histogram %s", depth, sum(accept_hist), accept_hist)
