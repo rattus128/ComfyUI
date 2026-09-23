@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import warnings
 import weakref
@@ -21,7 +22,9 @@ MALLOC_GRAPH_BREAKS = 0
 MALLOC_GRAPH_ROGUES = 0
 MALLOC_GRAPH_USED = False
 PREFETCH_RING_CAPACITY = 4096
-PREFETCH_RING_LOOKAHEAD = 8 * 1024 * 1024
+# A/B test scaffold: COMFY_PREFETCH_RING_MIB overrides the ring lookahead
+PREFETCH_RING_LOOKAHEAD = int(float(os.environ.get("COMFY_PREFETCH_RING_MIB", "8")) * 1024 * 1024)
+PREFETCH_RING_CHUNK = 96 * 1024
 ACTIVE_PREFETCH_RING = None
 PREFETCH_RING_MODULES = weakref.WeakSet()
 
@@ -63,7 +66,7 @@ class CompiledPrefetchRing:
 
     def configure(self):
         ck.configure_prefetch_ring(
-            self.descriptors, len(self.entries), PREFETCH_RING_LOOKAHEAD
+            self.descriptors, len(self.entries), PREFETCH_RING_LOOKAHEAD, PREFETCH_RING_CHUNK
         )
 
 
@@ -91,6 +94,7 @@ def prefetch_ring_begin(module, device, past_key_values, enabled):
         if ACTIVE_PREFETCH_RING is not ring:
             ring.configure()
             ACTIVE_PREFETCH_RING = ring
+        ck.start_prefetch_ring(device)
     else:
         if ACTIVE_PREFETCH_RING is not None:
             ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
