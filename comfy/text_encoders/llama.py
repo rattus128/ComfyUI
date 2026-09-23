@@ -514,11 +514,21 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.empty(dim, device=device, dtype=dtype))
         self.add = add
+        self._weight_add = None  # ((data_ptr, _version), weight + 1.0)
 
     def forward(self, x: torch.Tensor):
         w = self.weight
         if self.add:
-            w = w + 1.0
+            # weight + 1.0 is a constant per loaded weight: compute it once instead of one
+            # kernel per call. Not cached while capturing so the cache never lives in graph memory.
+            key = (w.data_ptr(), w._version)
+            cached = self._weight_add
+            if cached is not None and cached[0] == key:
+                w = cached[1]
+            else:
+                w = w + 1.0
+                if not (w.is_cuda and torch.cuda.is_current_stream_capturing()):
+                    self._weight_add = (key, w)
 
         return comfy.ldm.common_dit.rms_norm(x, w, self.eps)
 
