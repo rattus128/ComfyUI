@@ -106,10 +106,10 @@ def prefetch_ring_begin(module, device, past_key_values, enabled):
         if PREFETCH_RING_STATS_EVERY:
             ring.steps = getattr(ring, "steps", 0) + 1
             if ring.steps % PREFETCH_RING_STATS_EVERY == 0:
-                total, consumed, stalled, touched, skipped, waited_ns = ck.prefetch_ring.stats()
+                total, consumed, stalled, touched, skipped, waited_ns, smids, distinct = ck.prefetch_ring.stats()
                 logging.info(
-                    "Comfy prefetch ring after %d steps: touched %.2f GB skipped %.2f GB waited %.1f ms/step stalled %d",
-                    ring.steps, touched / 1e9, skipped / 1e9, waited_ns / 1e6 / ring.steps, stalled,
+                    "Comfy prefetch ring after %d steps: touched %.2f GB skipped %.2f GB waited %.1f ms/step stalled %d smids %s distinct-SM hist %s",
+                    ring.steps, touched / 1e9, skipped / 1e9, waited_ns / 1e6 / ring.steps, stalled, smids, distinct,
                 )
         ck.start_prefetch_ring(device)
     else:
