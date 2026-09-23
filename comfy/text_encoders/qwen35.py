@@ -391,13 +391,20 @@ class GatedAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
 
-    def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
+    def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None, norm=None):
         batch_size, seq_length, _ = x.shape
 
-        # Project Q (with gate), K, V
+        # Project Q (with gate), K, V; the block's pre-norm rides into the merged
+        # projection's activation quantizer where supported.
         if self.merged_qkv:
-            qg, xk, xv = self.qkv_proj(x).split((self.inner_size * 2, self.kv_size, self.kv_size), dim=-1)
+            if norm is not None:
+                qkv = comfy.ops.linear_input_act(self.qkv_proj, x, "rms_norm", norm.scale(), norm.eps)
+            else:
+                qkv = self.qkv_proj(x)
+            qg, xk, xv = qkv.split((self.inner_size * 2, self.kv_size, self.kv_size), dim=-1)
         else:
+            if norm is not None:
+                x = norm(x)
             qg = self.q_proj(x)
             xk = self.k_proj(x)
             xv = self.v_proj(x)
@@ -445,11 +452,11 @@ class Qwen35TransformerBlock(nn.Module):
         if self.layer_type == "linear_attention":
             h, present_key_value = self.linear_attn(self.input_layernorm(x), attention_mask=attention_mask, past_key_value=past_key_value)
         else:
-            h, present_key_value = self.self_attn(self.input_layernorm(x), attention_mask=attention_mask, freqs_cis=freqs_cis, optimized_attention=optimized_attention, past_key_value=past_key_value)
+            h, present_key_value = self.self_attn(x, attention_mask=attention_mask, freqs_cis=freqs_cis, optimized_attention=optimized_attention, past_key_value=past_key_value, norm=self.input_layernorm)
 
         # in-place into the input buffer so CUDA-graph replays land in the static x
         x = torch.add(x, h, out=output)
-        x = torch.add(x, self.mlp(self.post_attention_layernorm(x)), out=output)
+        x = torch.add(x, self.mlp(x, norm=self.post_attention_layernorm), out=output)
         return x, present_key_value
 
 

@@ -516,7 +516,8 @@ class RMSNorm(nn.Module):
         self.add = add
         self._weight_add = None  # (weight data_ptr, weight + 1.0)
 
-    def forward(self, x: torch.Tensor):
+    def scale(self) -> torch.Tensor:
+        """The multiplier applied to the normalized row (weight, or weight + 1)."""
         w = self.weight
         if self.add:
             # weight + 1.0 is a constant per loaded weight: compute it once instead of one
@@ -530,8 +531,10 @@ class RMSNorm(nn.Module):
                 w = w + 1.0
                 if not (w.is_cuda and torch.cuda.is_current_stream_capturing()):
                     self._weight_add = (key, w)
+        return w
 
-        return comfy.ldm.common_dit.rms_norm(x, w, self.eps)
+    def forward(self, x: torch.Tensor):
+        return comfy.ldm.common_dit.rms_norm(x, self.scale(), self.eps)
 
 
 
@@ -743,13 +746,20 @@ class MLP(nn.Module):
             self.activation = lambda a: torch.nn.functional.gelu(a, approximate="tanh")
             self.merged_input_act = None
 
-    def forward(self, x):
+    def forward(self, x, norm: Optional[RMSNorm] = None):
+        """norm, when given, is the pre-norm applied to x on the way into the first
+        projection (fused into its activation quantizer where supported)."""
         if self.merged_mlp:
-            x = self.gate_up_proj(x)
+            if norm is not None:
+                x = comfy.ops.linear_input_act(self.gate_up_proj, x, "rms_norm", norm.scale(), norm.eps)
+            else:
+                x = self.gate_up_proj(x)
             if self.merged_input_act is not None:
                 return comfy.ops.linear_input_act(self.down_proj, x, self.merged_input_act)
             gate, up = x.chunk(2, dim=-1)
             return self.down_proj(self.activation(gate) * up)
+        if norm is not None:
+            x = norm(x)
         return self.down_proj(self.activation(self.gate_proj(x)) * self.up_proj(x))
 
 class TransformerBlock(nn.Module):

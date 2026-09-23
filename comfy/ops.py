@@ -995,6 +995,31 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
 
     weight = linear.weight
     full_precision_mm = getattr(linear, "_full_precision_mm", False)
+    if (isinstance(weight, QuantizedTensor)
+            and weight._layout_cls == "AsymW4A8Int8Layout"
+            and not getattr(weight._params, "transposed", False)
+            and not full_precision_mm
+            and not comfy.model_management.in_training):
+        # Same cast and dispatch as the plain W4A8 forward (F.linear -> kitchen's
+        # layout handler), with the act handed to the activation quantizer; kitchen
+        # folds it into that kernel where it can and applies it eagerly otherwise.
+        weight, bias, offload_stream = cast_bias_weight(linear, x, offloadable=True)
+        try:
+            if not isinstance(weight, QuantizedTensor):
+                return _residual_out(torch.nn.functional.linear(
+                    _eager_input_act(x, input_act, act_weight, act_eps), weight, bias))
+            layout = get_layout_class("AsymW4A8Int8Layout")
+            qdata, s_rel, s_channel, correction, codebook = layout.get_plain_tensors(weight)
+            params = weight._params
+            return _residual_out(quant_ops.ck.w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook=codebook, correction=correction,
+                bias=bias, group_size=params.group_size,
+                convrot_groupsize=params.convrot_groupsize, out_dtype=params.orig_dtype,
+                mma_packed=params.mma_packed, mma_rows=params.mma_rows,
+                input_act=input_act, input_act_weight=act_weight, input_act_eps=act_eps))
+        finally:
+            uncast_bias_weight(linear, weight, bias, offload_stream)
+
     if (comfy.model_management.in_training
             or not isinstance(weight, QuantizedTensor)
             or weight._layout_cls != "TensorWiseINT8Layout"
