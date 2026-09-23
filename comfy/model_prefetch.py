@@ -21,7 +21,8 @@ MALLOC_GRAPHS = {}
 MALLOC_GRAPH_BREAKS = 0
 MALLOC_GRAPH_ROGUES = 0
 MALLOC_GRAPH_USED = False
-PREFETCH_RING_CAPACITY = 4096
+# read-order entries per step; the streamed W4A8 GEMM records K/(32*PackRows) runs per weight
+PREFETCH_RING_CAPACITY = 32768
 # A/B test scaffold: COMFY_PREFETCH_RING_MIB overrides the ring lookahead
 PREFETCH_RING_LOOKAHEAD = int(float(os.environ.get("COMFY_PREFETCH_RING_MIB", "8")) * 1024 * 1024)
 # diagnostics: log the issuer's cumulative counters every N steps (synchronizes the device)
@@ -51,8 +52,12 @@ class CompiledPrefetchRing:
             raise RuntimeError("prefetch ring descriptor capacity exceeded")
         size = tensor.numel() * tensor.element_size()
         if tensor.data_ptr() % 16 or size % 16:
-            raise RuntimeError("prefetch ring region must be 16-byte aligned (issuer uses 16-byte loads)")
-        if size:
+            raise RuntimeError("prefetch ring region must be 16-byte aligned (bulk prefetch granule)")
+        if not size:
+            return
+        if self.entries and self.entries[-1][0] + self.entries[-1][1] == tensor.data_ptr():
+            self.entries[-1] = (self.entries[-1][0], self.entries[-1][1] + size)
+        else:
             self.entries.append((tensor.data_ptr(), size))
 
     def finish_recording(self):
