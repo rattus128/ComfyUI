@@ -45,17 +45,24 @@ class LinearKV(FixedKV):
         return {"ctl": torch.zeros((2,), dtype=torch.int32, device=device),
                 "host": torch.zeros((2, 2), dtype=torch.int32).pin_memory(), "step": None, "parity": 0}
 
+    def decode_step(self, num_tokens):
+        return self.index > 0 and num_tokens <= 6
+
     def prepare(self, num_tokens):
-        # once per step (the first linear layer): tell this step's kernels what to replay
+        # runs every step outside the layer graphs (a replayed forward skips its Python):
+        # once per step (the first linear layer) tell this step's kernels what to replay,
+        # then record what this step leaves uncommitted
         t = self.ctl_tracker
-        if t is None or t["step"] == (self.index, num_tokens):
+        if t is None:
             return
-        t["step"] = (self.index, num_tokens)
-        t["parity"] ^= 1
-        host = t["host"][t["parity"]]
-        host[0] = self.uncommitted
-        host[1] = t["parity"]
-        self.ctl.copy_(host, non_blocking=True)
+        if t["step"] != (self.index, num_tokens):
+            t["step"] = (self.index, num_tokens)
+            t["parity"] ^= 1
+            host = t["host"][t["parity"]]
+            host[0] = self.uncommitted
+            host[1] = t["parity"]
+            self.ctl.copy_(host, non_blocking=True)
+        self.uncommitted = num_tokens if self.decode_step(num_tokens) else 0
 
     def rollback(self, discard=1):
         self.index -= discard
@@ -253,11 +260,7 @@ class GatedDeltaNet(nn.Module):
     def forward(self, x, past_key_value=None, **kwargs):
         batch_size, seq_len, _ = x.shape
 
-        use_recurrent = (
-            past_key_value is not None
-            and past_key_value.index > 0
-            and seq_len <= 6
-        )
+        use_recurrent = past_key_value is not None and past_key_value.decode_step(seq_len)
 
         use_deferred = use_recurrent and past_key_value.ctl is not None
         fused_available = getattr(comfy_kitchen, "gated_delta_decode_is_available", None)
@@ -276,7 +279,6 @@ class GatedDeltaNet(nn.Module):
             # decode: conv step into the side buffer, then gates + delta rule + gated norm
             # in one kernel; both commit the previous step's accepted tokens first
             kv = past_key_value
-            kv.uncommitted = seq_len
             with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (conv_weight, conv_bias):
                 comfy_kitchen.deltanet_conv_step_deferred(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
             with comfy.ops.CastBiasWeightContext(self.in_proj_a, x, offloadable=True) as (w_a, _), \
@@ -310,8 +312,6 @@ class GatedDeltaNet(nn.Module):
                     past_key_value.snap_backing[:seq_len - 1] if seq_len > 1 else None)
             return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1)), past_key_value
 
-        if past_key_value is not None:
-            past_key_value.uncommitted = 0  # this path writes the state directly
         mixed_qkv = proj.transpose(1, 2)  # [B, conv_dim, seq_len]
         b = self.in_proj_b(x)
         a = self.in_proj_a(x)
