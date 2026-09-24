@@ -287,7 +287,7 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
         weight = params[0]
         bias = params[1]
         if prefetch["signature"] is not None:
-            if isinstance(weight, QuantizedTensor) and not s._full_precision_mm:
+            if isinstance(s, MixedPrecisionOp) and isinstance(weight, QuantizedTensor) and not s._full_precision_mm:
                 # Relayout the resident weight into its decode kernel's read order, over its
                 # own qdata + scale bytes, so the prefetch ring streams it as one linear region.
                 qdata, qparams = get_layout_class(weight._layout_cls).decode_layout(weight._qdata, weight._params)
