@@ -1,6 +1,7 @@
 """YuE2 score/semantic generation and acoustic prefix conditioning."""
 
 import logging
+import os
 
 import torch
 from tokenizers import Tokenizer
@@ -110,6 +111,8 @@ class YuE2TEModel(torch.nn.Module):
         self.model = Llama2_(self.config, device=device, dtype=dtype, ops=operations)
         self.model.prefetch_dynamic_vbars = True
         self.model.graph_dynamic_vbar_blocks = True
+        # A/B test scaffold: COMFY_PREFETCH_RING=0 disables the ring
+        self.model.prefetch_ring_enabled = os.environ.get("COMFY_PREFETCH_RING", "1") != "0"
         self.dtypes = {dtype}
         self.execution_device = device
 
