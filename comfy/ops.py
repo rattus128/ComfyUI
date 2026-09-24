@@ -1015,7 +1015,7 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
                 x, qdata, s_rel, s_channel, codebook=codebook, correction=correction,
                 bias=bias, group_size=params.group_size,
                 convrot_groupsize=params.convrot_groupsize, out_dtype=params.orig_dtype,
-                mma_packed=params.mma_packed, mma_rows=params.mma_rows,
+                stream_rows=params.stream_rows,
                 input_act=input_act, input_act_weight=act_weight, input_act_eps=act_eps))
         finally:
             uncast_bias_weight(linear, weight, bias, offload_stream)
@@ -1277,16 +1277,13 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
             # int4 weight (packed int8 [N,K/2]) + fp8 per-group scale (weight_s_rel),
             # fp32 per-channel scale (weight_s_channel) + optional Lloyd-Max codebook.
             scale = pop_scale("weight_s_rel")
+            if scale is None:
+                raise ValueError(f"Missing W4A8 group scale (weight_s_rel) for layer {layer_name}")
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e4m3fn)
             params_conf = layer_conf.get("params", {})
             if not isinstance(params_conf, dict):
                 params_conf = {}
-            mma_packed = bool(layer_conf.get("mma_packed", params_conf.get("mma_packed", False)))
-            if scale is None and not mma_packed:
-                raise ValueError(f"Missing W4A8 group scale (weight_s_rel) for layer {layer_name}")
-            if scale is None:
-                scale = torch.empty(0, dtype=torch.float8_e4m3fn, device=device)
-            elif scale.dtype == torch.uint8:
-                scale = scale.view(torch.float8_e4m3fn)
             scales = {
                 "scale": scale,
                 "s_channel": pop_scale("weight_s_channel"),
@@ -1295,15 +1292,18 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
                 "convrot_groupsize": int(
                     layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))
                 ),
-                "mma_packed": mma_packed,
-                "mma_rows": int(layer_conf.get("mma_rows", params_conf.get("mma_rows", 16))),
             }
         else:
             raise ValueError(f"Unsupported quantization format: {module.quant_format}")
 
         params = layout_cls.Params(**scales, orig_dtype=compute_dtype, orig_shape=module._orig_shape)
+        weight = weight.to(device=device, dtype=qconfig["storage_t"])
+        if module.quant_format == "asym_w4a8_int8" and not module._full_precision_mm:
+            # Relayout into the decode kernel's read order so each weight is one linear
+            # region for the prefetch ring (comfy.model_prefetch). Checkpoints stay canonical.
+            weight, params = layout_cls.decode_layout(weight, params, comfy.model_management.get_torch_device())
         module.weight = torch.nn.Parameter(
-            QuantizedTensor(weight.to(device=device, dtype=qconfig["storage_t"]), module.layout_type, params),
+            QuantizedTensor(weight, module.layout_type, params),
             requires_grad=False,
         )
 
@@ -1352,9 +1352,6 @@ def _quantized_weight_state_dict(module, sd, prefix, extra_quant_conf=None, extr
         elif module.quant_format == "asym_w4a8_int8":
             quant_conf["group_size"] = getattr(params, "group_size", 16)
             quant_conf["convrot_groupsize"] = getattr(params, "convrot_groupsize", 256)
-            if getattr(params, "mma_packed", False):
-                quant_conf["mma_packed"] = True
-                quant_conf["mma_rows"] = getattr(params, "mma_rows", 16)
         if extra_quant_conf:
             quant_conf.update(extra_quant_conf)
         sd[f"{prefix}comfy_quant"] = torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8)

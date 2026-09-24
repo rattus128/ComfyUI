@@ -1078,9 +1078,8 @@ class Llama2_(nn.Module):
             elif intermediate_output < 0:
                 intermediate_output = len(self.layers) + intermediate_output
 
-        prefetch_ring = comfy.model_prefetch.prefetch_ring_begin(
-            self, x.device, past_key_values,
-            enable_graph and getattr(self, "prefetch_ring_enabled", False),
+        comfy.model_prefetch.prefetch_ring_begin(
+            self.layers, x.device, seq_len, enable_graph and getattr(self, "prefetch_ring_enabled", False),
         )
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
@@ -1132,7 +1131,6 @@ class Llama2_(nn.Module):
             prefetch_queue, x.device, None,
             malloc_scope="block"
         )
-        comfy.model_prefetch.prefetch_ring_end(prefetch_ring)
 
         if self.norm is not None:
             x = self.norm(x)

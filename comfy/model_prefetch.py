@@ -13,6 +13,7 @@ from comfy.cli_args import args
 import comfy.memory_management
 import comfy.model_management
 import comfy.ops
+from comfy.quant_ops import QuantizedTensor
 
 PREFETCH_QUEUES = []
 GRAPH_WARMED_MODULES = weakref.WeakSet()
@@ -21,110 +22,95 @@ MALLOC_GRAPHS = {}
 MALLOC_GRAPH_BREAKS = 0
 MALLOC_GRAPH_ROGUES = 0
 MALLOC_GRAPH_USED = False
-# read-order entries per step; the streamed W4A8 GEMM records K/(32*PackRows) runs per weight
-PREFETCH_RING_CAPACITY = 32768
 # A/B test scaffold: COMFY_PREFETCH_RING_MIB overrides the ring lookahead
 PREFETCH_RING_LOOKAHEAD = int(float(os.environ.get("COMFY_PREFETCH_RING_MIB", "8")) * 1024 * 1024)
 # diagnostics: log the issuer's cumulative counters every N steps (synchronizes the device)
 PREFETCH_RING_STATS_EVERY = int(os.environ.get("COMFY_PREFETCH_RING_STATS_EVERY", "0"))
 PREFETCH_RING_CHUNK = 96 * 1024
+# Bumped whenever a graphed layer runs outside graph replay (warm-up, capture) or an
+# execution ends: the resident weight addresses the ring was built from may have moved.
+PREFETCH_RING_GENERATION = 0
 ACTIVE_PREFETCH_RING = None
 PREFETCH_RING_MODULES = weakref.WeakSet()
 
 
-class CompiledPrefetchRing:
-    def __init__(self, device, cache_key):
-        self.device = device
-        self.cache_key = cache_key
-        self.entries = []
-        self.ready = False
-        with pause_malloc_graph(sync=True):
-            self.descriptors = torch.empty(
-                (PREFETCH_RING_CAPACITY, 2), device=device, dtype=torch.uint64
-            )
-
-    def record(self, tensor):
-        if not tensor.is_cuda or tensor.device != self.descriptors.device:
-            raise RuntimeError("prefetch ring region must be on the ring CUDA device")
-        if not tensor.is_contiguous():
-            raise RuntimeError("prefetch ring region must be contiguous")
-        if len(self.entries) == PREFETCH_RING_CAPACITY:
-            raise RuntimeError("prefetch ring descriptor capacity exceeded")
-        size = tensor.numel() * tensor.element_size()
-        if tensor.data_ptr() % 16 or size % 16:
-            raise RuntimeError("prefetch ring region must be 16-byte aligned (bulk prefetch granule)")
-        if not size:
-            return
-        if self.entries and self.entries[-1][0] + self.entries[-1][1] == tensor.data_ptr():
-            self.entries[-1] = (self.entries[-1][0], self.entries[-1][1] + size)
+def _prefetch_ring_regions(module, seq_len):
+    """(address, bytes) of each weight the step's decode kernels credit to the ring, in
+    forward order. decode_layout stores W4A8 weights in the streamed kernel's read order,
+    so every weight is one linear region. None while a weight is not VBAR-resident."""
+    regions = []
+    for s in module.modules():
+        weight = getattr(s, "weight", None)
+        if not isinstance(weight, QuantizedTensor):
+            continue
+        params = weight._params
+        if weight._layout_cls == "AsymW4A8Int8Layout":
+            if not params.stream_rows or seq_len > 8:
+                continue
+        elif weight._layout_cls == "TensorWiseINT8Layout":
+            if seq_len > 2 or weight.shape[1] % 16:
+                continue
         else:
-            self.entries.append((tensor.data_ptr(), size))
+            continue
+        resident = getattr(s, "_v_weight", None)
+        if resident is None:
+            return None
+        regions.append((resident._qdata.data_ptr(), resident._qdata.numel() * resident._qdata.element_size()))
+    return regions
 
-    def finish_recording(self):
-        ck.set_prefetch_ring_recorder(None)
-        if not self.entries:
-            return
+
+class CompiledPrefetchRing:
+    def __init__(self, device, key, regions):
+        self.device = device
+        self.key = key
+        self.steps = 0
         with pause_malloc_graph(sync=True):
-            host = torch.tensor(self.entries, dtype=torch.uint64)
-            self.descriptors[:len(self.entries)].copy_(host)
-        self.ready = True
-        logging.info(
-            "Comfy prefetch ring recorded %d regions (%.2f GiB)",
-            len(self.entries), sum(size for _, size in self.entries) / (1024 ** 3),
-        )
+            self.descriptors = torch.tensor(regions, dtype=torch.uint64, device=device)
+        self.total = sum(size for _, size in regions)
+        logging.info("Comfy prefetch ring: %d regions (%.2f GiB)", len(regions), self.total / (1024 ** 3))
 
     def configure(self):
-        ck.configure_prefetch_ring(
-            self.descriptors, len(self.entries), PREFETCH_RING_LOOKAHEAD, PREFETCH_RING_CHUNK
-        )
+        ck.configure_prefetch_ring(self.descriptors, len(self.descriptors), PREFETCH_RING_LOOKAHEAD, PREFETCH_RING_CHUNK)
 
 
-def _prefetch_ring_cache_key(past_key_values):
-    key = []
-    for cache in past_key_values:
-        for name in ("key", "value", "recurrent_state", "conv_state"):
-            tensor = getattr(cache, name, None)
-            if tensor is not None:
-                key.append((tensor.data_ptr(), tensor.numel(), tensor.element_size()))
-    return tuple(key)
-
-
-def prefetch_ring_begin(module, device, past_key_values, enabled):
+def _stop_prefetch_ring():
     global ACTIVE_PREFETCH_RING
-    if not enabled or not hasattr(ck, "prefetch_ring_is_available") or not ck.prefetch_ring_is_available():
-        return None
-    cache_key = _prefetch_ring_cache_key(past_key_values)
-    ring = getattr(module, "_compiled_prefetch_ring", None)
-    if ring is None or ring.cache_key != cache_key:
-        ring = CompiledPrefetchRing(device, cache_key)
-        module._compiled_prefetch_ring = ring
-        PREFETCH_RING_MODULES.add(module)
-    if ring.ready:
-        if ACTIVE_PREFETCH_RING is not ring:
-            ring.configure()
-            ACTIVE_PREFETCH_RING = ring
-        if PREFETCH_RING_STATS_EVERY:
-            ring.steps = getattr(ring, "steps", 0) + 1
-            if ring.steps % PREFETCH_RING_STATS_EVERY == 0:
-                total, consumed, stalled, touched, skipped, waited_ns, smids, distinct = ck.prefetch_ring.stats()
-                logging.info(
-                    "Comfy prefetch ring after %d steps: touched %.2f GB skipped %.2f GB waited %.1f ms/step stalled %d smids %s distinct-SM hist %s",
-                    ring.steps, touched / 1e9, skipped / 1e9, waited_ns / 1e6 / ring.steps, stalled, smids, distinct,
-                )
-        ck.start_prefetch_ring(device)
-    else:
-        if ACTIVE_PREFETCH_RING is not None:
-            ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
-            ACTIVE_PREFETCH_RING = None
-        ck.set_prefetch_ring_recorder(ring.record)
-    return ring
+    if ACTIVE_PREFETCH_RING is not None:
+        ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
+        ACTIVE_PREFETCH_RING = None
 
 
-def prefetch_ring_end(ring):
-    if ring is None:
+def prefetch_ring_begin(module, device, seq_len, enabled):
+    global ACTIVE_PREFETCH_RING
+    if not enabled or not ck.prefetch_ring_is_available():
         return
-    if not ring.ready:
-        ring.finish_recording()
+    key = (PREFETCH_RING_GENERATION, seq_len)
+    ring = getattr(module, "_prefetch_ring", None)
+    if ring is None or ring.key != key:
+        # Build only after a full step at this generation (every layer replayed its
+        # graph), so the resident weights are where _v_weight says they are.
+        regions = None
+        if getattr(module, "_prefetch_ring_seen", None) == key:
+            regions = _prefetch_ring_regions(module, seq_len)
+        module._prefetch_ring_seen = key
+        if not regions:
+            _stop_prefetch_ring()
+            return
+        ring = CompiledPrefetchRing(device, key, regions)
+        module._prefetch_ring = ring
+        PREFETCH_RING_MODULES.add(module)
+    if ACTIVE_PREFETCH_RING is not ring:
+        ring.configure()
+        ACTIVE_PREFETCH_RING = ring
+    if PREFETCH_RING_STATS_EVERY:
+        ring.steps += 1
+        if ring.steps % PREFETCH_RING_STATS_EVERY == 0:
+            total, consumed, stalled, touched, skipped, waited_ns, smids, distinct = ck.prefetch_ring.stats()
+            logging.info(
+                "Comfy prefetch ring after %d steps: touched %.2f GB skipped %.2f GB waited %.1f ms/step stalled %d smids %s distinct-SM hist %s",
+                ring.steps, touched / 1e9, skipped / 1e9, waited_ns / 1e6 / ring.steps, stalled, smids, distinct,
+            )
+    ck.start_prefetch_ring(device)
 
 def _malloc_graph_break():
     global MALLOC_GRAPH_BREAKS
@@ -258,13 +244,10 @@ def cleanup_prefetch_queues():
     global MALLOC_GRAPH_BREAKS
     global MALLOC_GRAPH_ROGUES
     global MALLOC_GRAPH_USED
-    global ACTIVE_PREFETCH_RING
+    global PREFETCH_RING_GENERATION
 
-    if hasattr(ck, "set_prefetch_ring_recorder"):
-        ck.set_prefetch_ring_recorder(None)
-    if ACTIVE_PREFETCH_RING is not None and ACTIVE_PREFETCH_RING.ready:
-        ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
-    ACTIVE_PREFETCH_RING = None
+    _stop_prefetch_ring()
+    PREFETCH_RING_GENERATION += 1
     if PREFETCH_RING_MODULES:
         comfy.model_management.synchronize()
     cleanup_malloc_graph()
@@ -277,8 +260,7 @@ def cleanup_prefetch_queues():
             if comfy_modules is not None:
                 cleanup_prefetched_modules(prefetched_module, comfy_modules)
     for module in PREFETCH_RING_MODULES:
-        if hasattr(module, "_compiled_prefetch_ring"):
-            del module._compiled_prefetch_ring
+        del module._prefetch_ring
     PREFETCH_QUEUES = []
     GRAPH_WARMED_MODULES.clear()
     if MALLOC_GRAPH_USED:
@@ -288,6 +270,7 @@ def cleanup_prefetch_queues():
     MALLOC_GRAPH_USED = False
 
 def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_graph=False, generator=None, malloc_scope=None):
+    global PREFETCH_RING_GENERATION
     malloc_graph = MALLOC_GRAPHS.get(threading.get_ident())
     if malloc_graph is not None and not malloc_graph._comfy_active:
         malloc_graph = None
@@ -340,6 +323,11 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
         queue[0] = (None, (module, []))
         graph["graph"].replay()
         return
+    if enable_graph and module is not None:
+        # Running outside replay: the layer's weights may land at new addresses, and
+        # a capture's device sync would deadlock against a polling ring issuer.
+        PREFETCH_RING_GENERATION += 1
+        _stop_prefetch_ring()
 
     fully_faulted = False
     prefetch = queue[0]
@@ -368,10 +356,6 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
                     graph.register_generator_state(generator)
                 malloc_graph.resume()
                 # Capture-time VBAR eviction is safe after prior work completes.
-                # The device sync would deadlock against a polling ring issuer
-                # waiting on this stream, so stop it for the rest of the step.
-                if ACTIVE_PREFETCH_RING is not None:
-                    ck.disable_prefetch_ring(device)
                 comfy.model_management.synchronize()
                 capture_stream.wait_stream(comfy.model_management.current_stream(device))
                 malloc_graph.pause(sync=True)
