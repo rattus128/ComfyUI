@@ -6,6 +6,7 @@ import os
 import torch
 from tokenizers import Tokenizer
 
+from comfy.cli_args import args
 import comfy.model_management
 import comfy.model_prefetch
 import comfy.ops
@@ -27,7 +28,9 @@ INSTRUCTIONS = {
 }
 
 
-def distribution(logits, history, step, phase, temperature, top_p, top_k, repetition_penalty, penalty_window, min_tokens, legacy_off=False):
+def distribution(logits, recent, block_end, phase, temperature, top_p, top_k, repetition_penalty, legacy_off=False):
+    # Graph-replayable: `recent` holds the last penalty_window tokens (vocab_size where there is none
+    # yet) and `block_end` is the device flag for step < min_tokens.
     scores = logits.clone() if legacy_off else logits.float().clone()
     end = ABC_END if phase == "abc" else MUSIC_END
     allowed = torch.full_like(scores, -torch.inf)
@@ -37,13 +40,11 @@ def distribution(logits, history, step, phase, temperature, top_p, top_k, repeti
         allowed[..., CODEC_OFFSET:CODEC_OFFSET + CODEC_SIZE] = 0
     allowed[..., end] = 0
     scores += allowed
-    if step < min_tokens:
-        scores[..., end] = -torch.inf
-    if repetition_penalty != 1.0 and history:
-        recent = torch.tensor([history[-penalty_window:]], dtype=torch.long, device=scores.device)
-        counts = torch.zeros_like(scores)
+    scores[..., end] = scores[..., end].masked_fill(block_end, -torch.inf)
+    if repetition_penalty != 1.0:
+        counts = torch.zeros((*scores.shape[:-1], scores.shape[-1] + 1), device=scores.device, dtype=scores.dtype)
         counts.scatter_add_(-1, recent, torch.ones_like(recent, dtype=scores.dtype))
-        penalty = repetition_penalty ** counts
+        penalty = repetition_penalty ** counts[..., :-1]
         scores = torch.where(scores < 0, scores * penalty, scores / penalty)
     if temperature == 0:
         return scores
@@ -171,36 +172,74 @@ class YuE2TEModel(torch.nn.Module):
                               rope_matrix(self.model.compute_freqs_cis(positions, device)))
         history = []
         end = ABC_END if phase == "abc" else MUSIC_END
+        min_tokens = sampling.pop("min_tokens")
+        penalty_window = sampling.pop("penalty_window")
+        # The sampler state lives on the device: the step head (sample, embed, rotary) is one graph
+        # replay and the host reads the tokens back in batches instead of syncing every step.
+        recent = torch.full((1, penalty_window), logits.shape[-1], device=device, dtype=torch.long)
+        block_end = torch.tensor(min_tokens > 0, device=device)
+        step_index = torch.zeros((), device=device, dtype=torch.long)
+        tokens = torch.empty((max_tokens,), device=device, dtype=torch.long)
+
+        def head():
+            guided = logits if cfg_scale == 1.0 else logits[1:] + cfg_scale * (logits[:1] - logits[1:])
+            scores = distribution(guided, recent, block_end, phase, legacy_off=legacy_off, **sampling)
+            if sampling["temperature"] == 0:
+                next_id = scores.argmax(-1, keepdim=True)
+            else:
+                probabilities = scores.softmax(-1).to(rng_device)
+                next_id = torch.multinomial(probabilities, 1, generator=generator).to(device)
+            decode_tokens.copy_(next_id)
+            tokens.index_copy_(0, step_index.view(1), next_id.view(1))
+            recent.scatter_(1, (step_index % penalty_window).view(1, 1), next_id)
+            step_index.add_(1)
+            if fixed_kv:
+                decode_buffers[0].copy_(self.model.embed_tokens(decode_tokens, out_dtype=dtype))
+                decode_buffers[1].copy_(rope_matrix(self.model.compute_freqs_cis(positions, device)))
+                positions.add_(1)
+
+        graph = None
+        use_graph = fixed_kv and comfy.model_management.is_device_cuda(device) and not args.disable_cuda_graphs
         progress = comfy.utils.ProgressBar(max_tokens)
         try:
             for step in comfy.utils.model_trange(max_tokens, desc="YuE2 ABC sampling" if phase == "abc" else "YuE2 music sampling", unit="token"):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                guided = logits if cfg_scale == 1.0 else logits[1:] + cfg_scale * (logits[:1] - logits[1:])
-                scores = distribution(guided, history, step, phase, legacy_off=legacy_off, **sampling)
-                if sampling["temperature"] == 0:
-                    next_id = scores.argmax(-1, keepdim=True)
+                if step == min_tokens:
+                    block_end.fill_(False)
+                if graph is not None:
+                    graph.replay()
+                elif use_graph and step == 2:
+                    # two eager steps warm the sampler's workspaces; captured outside the compiler bracket
+                    graph = torch.cuda.CUDAGraph()
+                    graph.register_generator_state(generator)
+                    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                        head()
+                    graph.replay()
                 else:
-                    probabilities = scores.softmax(-1).to(rng_device)
-                    next_id = torch.multinomial(probabilities, 1, generator=generator).to(device)
-                decode_tokens.copy_(next_id)
-                token = next_id.item()
+                    head()
                 progress.update_absolute(step + 1)
-                if token == end:
-                    return history, False
-                history.append(token)
                 if step + 1 < max_tokens:
                     # Keep decode allocations stable; sampling has a changing history window.
                     if fixed_kv:
                         comfy.model_prefetch.malloc_graph_begin(device)
-                    output = self.model(decode_tokens, past_key_values=cache, dtype=dtype, position_ids=positions,
-                                        attention_mask=mask[:, :prefix_length + step + 1] if mask is not None and not fixed_kv else None,
-                                        decode_buffers=decode_buffers)
+                    if fixed_kv:
+                        output = self.model(None, embeds=decode_buffers[0], freqs_cis=decode_buffers[1], past_key_values=cache, dtype=dtype,
+                                            decode_buffers=decode_buffers)
+                    else:
+                        output = self.model(decode_tokens, past_key_values=cache, dtype=dtype, position_ids=positions,
+                                            attention_mask=mask[:, :prefix_length + step + 1] if mask is not None else None)
+                        positions.add_(1)
                     logits.copy_(self.model.lm_head(output[0][:, -1]))
                     cache = output[2]
                     del output
                     if fixed_kv:
                         comfy.model_prefetch.malloc_graph_end()
-                    positions.add_(1)
+                # the read syncs behind the forward just queued; a late end token wastes at most 15 steps
+                if (step + 1) % 16 == 0 or step + 1 == max_tokens:
+                    for token in tokens[len(history):step + 1].tolist():
+                        if token == end:
+                            return history, False
+                        history.append(token)
         finally:
             # Each phase has different KV buffers and may change the CFG batch size.
             comfy.model_prefetch.cleanup_prefetch_queues()

@@ -984,7 +984,8 @@ class Llama2_(nn.Module):
                                     device=device)
 
     def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True,
-                dtype=None, position_ids=None, embeds_info=[], past_key_values=None, input_ids=None,deepstack_embeds=None, visual_pos_masks=None, decode_buffers=None):
+                dtype=None, position_ids=None, embeds_info=[], past_key_values=None, input_ids=None,deepstack_embeds=None, visual_pos_masks=None, decode_buffers=None,
+                freqs_cis=None):
         if embeds is not None:
             x = embeds
         else:
@@ -999,10 +1000,11 @@ class Llama2_(nn.Module):
         if fixed_kv_decode:
             attention_mask = None
 
-        if position_ids is None:
-            position_ids = torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(0)
-
-        freqs_cis = self.compute_freqs_cis(position_ids, x.device)
+        if freqs_cis is None:
+            # a graphed decode loop computes the step's rotary matrix itself (into decode_buffers[1])
+            if position_ids is None:
+                position_ids = torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(0)
+            freqs_cis = self.compute_freqs_cis(position_ids, x.device)
 
         mask = None
         if attention_mask is not None:
@@ -1025,9 +1027,11 @@ class Llama2_(nn.Module):
                 x = x.clone()
             else:
                 hidden_buffer, rotary_buffer = decode_buffers
-                hidden_buffer.copy_(x)
+                if x is not hidden_buffer:
+                    hidden_buffer.copy_(x)
                 x = hidden_buffer
-                rotary_buffer.copy_(rope_matrix(freqs_cis))
+                if freqs_cis is not rotary_buffer:
+                    rotary_buffer.copy_(rope_matrix(freqs_cis))
                 freqs_cis = rotary_buffer
 
         intermediate = None
