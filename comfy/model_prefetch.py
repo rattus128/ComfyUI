@@ -54,7 +54,6 @@ def _prefetch_ring_regions(module, seq_len):
             continue
         resident = getattr(s, "_v_weight", None)
         if resident is None:
-            logging.info("RINGDBG no _v_weight on %s stream_rows=%s", type(s).__name__, getattr(params, "stream_rows", None))
             return None
         regions.append((resident._qdata.data_ptr(), resident._qdata.numel() * resident._qdata.element_size()))
     return regions
@@ -93,7 +92,6 @@ def prefetch_ring_begin(module, device, seq_len, enabled):
         regions = None
         if getattr(module, "_prefetch_ring_seen", None) == key:
             regions = _prefetch_ring_regions(module, seq_len)
-        logging.info("RINGDBG key=%s seen=%s regions=%s", key, getattr(module, "_prefetch_ring_seen", None), None if regions is None else len(regions))
         module._prefetch_ring_seen = key
         if not regions:
             _stop_prefetch_ring()

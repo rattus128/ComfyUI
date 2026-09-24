@@ -1298,13 +1298,11 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
 
         params = layout_cls.Params(**scales, orig_dtype=compute_dtype, orig_shape=module._orig_shape)
         weight = weight.to(device=device, dtype=qconfig["storage_t"])
-        if module.quant_format == "asym_w4a8_int8" and not module._full_precision_mm:
+        compute_device = comfy.model_management.get_torch_device()
+        if module.quant_format == "asym_w4a8_int8" and module.can_use_quantized_matmul(get_disabled_quant_formats(compute_device)):
             # Relayout into the decode kernel's read order so each weight is one linear
             # region for the prefetch ring (comfy.model_prefetch). Checkpoints stay canonical.
-            weight, params = layout_cls.decode_layout(weight, params, comfy.model_management.get_torch_device())
-            logging.info("RINGDBG load %s dev=%s fp=%s rows=%s shape=%s", layer_name, weight.device, module._full_precision_mm, params.stream_rows, tuple(weight.shape))
-        else:
-            logging.info("RINGDBG load %s fmt=%s fp=%s SKIP", layer_name, module.quant_format, module._full_precision_mm)
+            weight, params = layout_cls.decode_layout(weight, params, compute_device)
         module.weight = torch.nn.Parameter(
             QuantizedTensor(weight, module.layout_type, params),
             requires_grad=False,
