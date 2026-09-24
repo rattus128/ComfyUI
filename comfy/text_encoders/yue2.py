@@ -266,6 +266,7 @@ class YuE2TEModel(torch.nn.Module):
             repetition_penalty=tokens["repetition_penalty"], penalty_window=50,
             min_tokens=min(200, max_tokens),
         )
+        logging.info("YuE2 semantic tokens %d hash %x", len(semantic), hash(tuple(semantic)) & 0xffffffffffff)  # TEMP A/B check
         conditioning, chunks = self._acoustic_conditioning(prefix, semantic, dtype)
         return conditioning, None, {
             "yue2_chunks": chunks, "yue2_abc_ids": abc_ids, "yue2_frames": len(semantic),
