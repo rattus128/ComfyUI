@@ -851,8 +851,8 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config, device=device, dtype=dtype, ops=ops)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=device, dtype=dtype)
-        # unit scale for the residual add fused into o_proj's epilogue (residual + scale * o_proj)
-        self.register_buffer("residual_scale", torch.ones((1,), device=device, dtype=dtype), persistent=False)
+        # unit per-channel scale for the residual add fused into o_proj's epilogue (residual + scale * o_proj)
+        self.register_buffer("residual_scale", torch.ones((config.hidden_size,), device=device, dtype=dtype), persistent=False)
 
     def forward(
         self,
