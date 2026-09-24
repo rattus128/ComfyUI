@@ -37,17 +37,20 @@ class LinearKV(FixedKV):
     proj_buf: torch.Tensor = None
     gates_buf: torch.Tensor = None
     sumsq_buf: torch.Tensor = None
-    ctl: torch.Tensor = None  # int32 device {pending, parity}
-    ctl_tracker: dict = None  # {"host": pinned int32 [2, 2], "step": last (index, num_tokens) written}
+    ctl: torch.Tensor = None  # int32 device {pending, parity, alt}
+    ctl_tracker: dict = None  # {"host": pinned int32 [2, 3], "step": last (index, num_tokens) written, "alt", "tree"}
     uncommitted: int = 0  # tokens of the last deferred step still to commit (rollback trims it)
 
     @staticmethod
     def deferred_tracker(device):
-        return {"ctl": torch.zeros((2,), dtype=torch.int32, device=device),
-                "host": torch.zeros((2, 2), dtype=torch.int32).pin_memory(), "step": None, "parity": 0}
+        # alt: verify slot standing in for the last pending token (an accepted tree sibling), -1 if none;
+        # tree: d of a tree verify (2d + 1 tokens, slots d + 1..2d siblings of chain slots 1..d), 0 for a chain
+        return {"ctl": torch.zeros((3,), dtype=torch.int32, device=device),
+                "host": torch.zeros((2, 3), dtype=torch.int32).pin_memory(), "step": None, "parity": 0,
+                "alt": -1, "tree": 0}
 
     def decode_step(self, num_tokens):
-        return self.index > 0 and num_tokens <= 6
+        return self.index > 0 and num_tokens <= 8
 
     def prepare(self, num_tokens):
         # runs every step outside the layer graphs (a replayed forward skips its Python):
@@ -62,8 +65,14 @@ class LinearKV(FixedKV):
             host = t["host"][t["parity"]]
             host[0] = self.uncommitted
             host[1] = t["parity"]
+            host[2] = t["alt"]
+            t["alt"] = -1
             self.ctl.copy_(host, non_blocking=True)
         self.uncommitted = num_tokens if self.decode_step(num_tokens) else 0
+
+    def commit_sibling(self, base, accepts, depth):
+        # the last of the accepts + 2 pending tokens is the sibling at verify slot depth + 1 + accepts
+        self.ctl_tracker["alt"] = depth + 1 + accepts
 
     def rollback(self, discard=1):
         self.index -= discard
@@ -280,8 +289,9 @@ class GatedDeltaNet(nn.Module):
             # decode: conv step into the side buffer, then gates + delta rule + gated norm
             # in one kernel; both commit the previous step's accepted tokens first
             kv = past_key_value
+            tree = kv.ctl_tracker["tree"] if seq_len == 2 * kv.ctl_tracker["tree"] + 1 else 0
             with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (conv_weight, conv_bias):
-                comfy_kitchen.deltanet_conv_step_deferred(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
+                comfy_kitchen.deltanet_conv_step_deferred(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl, tree)
             with comfy.ops.CastBiasWeightContext(self.in_proj_a, x, offloadable=True) as (w_a, _), \
                  comfy.ops.CastBiasWeightContext(self.in_proj_b, x, offloadable=True) as (w_b, _):
                 if isinstance(w_a, QuantizedTensor):
@@ -291,8 +301,10 @@ class GatedDeltaNet(nn.Module):
                 core_attn_out = comfy_kitchen.gated_delta_decode_deferred(
                     x, w_a, w_b, kv.dt_bias, kv.g_decay, kv.recurrent_state,
                     self.key_dim, self.num_key_heads, self.key_head_dim ** -0.5, z, kv.norm_weight, self.norm.eps,
-                    kv.qkv_buf, kv.gates_buf, kv.sumsq_buf, kv.ctl)
+                    kv.qkv_buf, kv.gates_buf, kv.sumsq_buf, kv.ctl, tree)
             return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1)), past_key_value
+        if use_recurrent and past_key_value.ctl_tracker is not None and past_key_value.ctl_tracker["tree"]:
+            raise RuntimeError("tree verify requires the deferred DeltaNet kernels")
 
         if use_fused:
             # decode: kitchen conv step, then gates + delta rule + gated norm in one kernel
@@ -473,7 +485,7 @@ class GatedAttention(nn.Module):
 
         # KV cache
         present_key_value = past_key_value
-        if past_key_value is not None and seq_length <= 6 and attention_mask is None:
+        if past_key_value is not None and seq_length <= 8 and attention_mask is None:
             output = past_key_value.decode(xq, xk, xv, self.num_kv_heads)
         else:
             if past_key_value is not None:
@@ -835,10 +847,15 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                         "repetition_penalty": repetition_penalty,
                         "presence_penalty": kwargs.get("presence_penalty", 0.0) or 0.0,
                         "seed": seed if seed is not None else 42}
-        fixed_depth = None if mtp is True else max(2, min(5, int(mtp)))
-        return self._generate_mtp(embeds, max_length, stop_tokens, sampling=sampling, fixed_depth=fixed_depth)
+        # "treeN": greedy comb-tree drafting, N chain drafts each with its runner-up sibling (2N + 1 verify rows)
+        tree = isinstance(mtp, str) and mtp.startswith("tree")
+        if tree:
+            mtp = mtp[4:]
+            tree = sampling is None
+        fixed_depth = None if mtp is True else max(1 if tree else 2, min(3 if tree else 5, int(mtp)))
+        return self._generate_mtp(embeds, max_length, stop_tokens, sampling=sampling, fixed_depth=fixed_depth, tree=tree)
 
-    def _generate_mtp(self, embeds, max_length, stop_tokens, sampling=None, fixed_depth=None):
+    def _generate_mtp(self, embeds, max_length, stop_tokens, sampling=None, fixed_depth=None, tree=False):
         device = embeds.device
         cfg = self.model.config
         if stop_tokens is None:
@@ -906,18 +923,26 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                              for kv in pkv if isinstance(kv, LinearKV))
 
         def set_depth(d):
-            nonlocal depth, verify_buffers
+            nonlocal depth, verify_buffers, rows
             depth = d
+            rows = 2 * d + 1 if tree else d + 1  # verify rows: chain, then (tree) one sibling per chain draft
             for kv in pkv:
+                if isinstance(kv, LinearKV) and kv.ctl_tracker is not None:
+                    kv.ctl_tracker["tree"] = d if tree else 0
+                if isinstance(kv, FixedKVBias):
+                    kv.tracker["tree"] = d if tree else 0
                 if isinstance(kv, LinearKV) and kv.ctl is None:
                     # snapshot views share one backing slab so the fused kernel can write them
                     kv.snap_backing = torch.empty((d,) + tuple(kv.recurrent_state.shape), device=device, dtype=torch.float32)
                     kv.conv_snap_backing = torch.empty((d,) + tuple(kv.conv_state.shape), device=device, dtype=kv.conv_state.dtype)
                     kv.snapshots = [(kv.snap_backing[s], kv.conv_snap_backing[s]) for s in range(d)]
             # static hidden/rope buffers: graphed layers bake their input addresses
-            verify_buffers = (torch.empty((embeds.shape[0], d + 1, cfg.hidden_size), device=device, dtype=dt), freqs_at(pos, d + 1).clone())
+            verify_buffers = (torch.empty((embeds.shape[0], rows, cfg.hidden_size), device=device, dtype=dt), freqs_at(pos, rows).clone())
 
+        rows = None
         set_depth(depth)
+        # rope positions of the verify rows relative to pos: chain 0..d, siblings 1..d
+        tree_offsets = torch.tensor([list(range(depth + 1)) + list(range(1, depth + 1))], device=device, dtype=torch.long) if tree else None
         use_graph = (device.type == "cuda"
                      and comfy.model_management.NUM_STREAMS > 0
                      and not comfy.model_management.args.disable_cuda_graphs)
@@ -1012,49 +1037,69 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             nonlocal pos
             drafts = []
             alts = []
+            hiddens = []
             tok_in, hid_in = nt_buf, h_buf
             for k in range(depth):
                 dk, rk, ak = draft(tok_in, hid_in, pos + k)
                 if k < depth - 1:
                     dk = dk.clone()  # later replays overwrite the static output
                     ak = ak.clone()
+                    if tree:
+                        rk = rk.clone()
                 drafts.append(dk)
                 alts.append(ak)
+                hiddens.append(rk)
                 tok_in, hid_in = dk, rk
-            ev = self.model.embed_tokens(torch.cat([nt_buf] + drafts, dim=1)).to(dt)
-            x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers)
+            ev = self.model.embed_tokens(torch.cat([nt_buf] + drafts + (alts if tree else []), dim=1)).to(dt)
+            x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers,
+                                         position_ids=tree_offsets + pos if tree else None)
             # all verify positions in one lm_head GEMV, accept decided GPU-side, one sync
             lg = verify_logits(x)
+            sibling = False
             if sampling is None:
                 toks = lg.argmax(dim=-1)
                 vals = torch.cat([toks[0]] + [d[0] for d in drafts] + [a[0] for a in alts]).tolist()
-                t, dr, al = vals[:depth + 1], vals[depth + 1:2 * depth + 1], vals[2 * depth + 1:]
+                t, dr, al = vals[:rows], vals[rows:rows + depth], vals[rows + depth:]
                 accepts = 0
                 while accepts < depth and t[accepts] == dr[accepts]:
                     accepts += 1
-                if accepts < depth:
-                    # tree-drafting probe: would the runner-up draft at the break position have been the correction?
-                    alt_hist[accepts][al[accepts] == t[accepts]] += 1
-                next_toks = tuple(toks[:, i:i + 1] for i in range(depth + 1))
+                row = accepts  # verify row whose argmax is the next token
                 commit = tuple(dr[:accepts]) + (t[accepts],)
+                if accepts < depth:
+                    # would the runner-up draft at the break position have been the correction?
+                    # (a tree verify then commits it and its own next token)
+                    hit = al[accepts] == t[accepts]
+                    alt_hist[accepts][hit] += 1
+                    if tree and hit:
+                        sibling = True
+                        row = depth + 1 + accepts
+                        commit = commit + (t[row],)
+                next_tok = toks[:, row:row + 1]
             else:
                 dr, corr, accepted = verify_sample(lg, drafts)
                 vals = torch.cat([dr[:, 0], corr[:, 0], accepted.reshape(1)]).tolist()
                 dr, cv, accepts = vals[:depth], vals[depth:2 * depth + 1], vals[-1]
-                next_toks = tuple(corr[i:i + 1] for i in range(depth + 1))
+                row = accepts
+                next_tok = corr[accepts:accepts + 1]
                 commit = tuple(dr[:accepts]) + (cv[accepts],)
-            if accepts < depth:
+            if len(commit) < rows:
                 for kv in pkv:
-                    kv.rollback(depth - accepts)
+                    kv.rollback(rows - len(commit))
+            if sibling:
+                for kv in pkv:
+                    kv.commit_sibling(pos, accepts, depth)
             if accepts < depth - 1:
                 mtp_kv.rollback(depth - 1 - accepts)  # mtp entries fed by a rejected draft token
-            nt_buf.copy_(next_toks[accepts])
-            h_buf.copy_(x[:, accepts:accepts + 1, :])
+            if sibling:
+                # the mtp entry fed by the rejected chain draft is refilled from its accepted sibling
+                draft(alts[accepts], hiddens[accepts], pos + accepts + 1)
+            nt_buf.copy_(next_tok)
+            h_buf.copy_(x[:, row:row + 1, :])
             if penalized:
                 for d in drafts[:accepts]:
                     pen_mask.index_fill_(0, d.reshape(-1), True)
                 pen_mask.index_fill_(0, nt_buf.reshape(-1), True)
-            pos += accepts + 1
+            pos += len(commit)
             return accepts, commit
 
         # A draft costs one MTP block plus one lm_head read (~1.6 GB here against ~14 GB for
@@ -1063,7 +1108,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         DRAFT_SURVIVAL = 0.15
         probe = None if fixed_depth is not None else 64  # steps of the depth-3 probe
         accept_hist = [0] * 6  # steps by number of accepted drafts
-        alt_hist = [[0, 0] for _ in range(6)]  # [break position][runner-up == correction] (tree-drafting probe)
+        alt_hist = [[0, 0] for _ in range(6)]  # [break position][runner-up == correction] (tree: sibling committed)
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
@@ -1101,8 +1146,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                             draft_capture()
         finally:
             console.close()
-            logging.debug("mtp depth %d: %d steps, accepted-draft histogram %s", depth, sum(accept_hist), accept_hist)
-            logging.debug("mtp runner-up probe [break position][miss, hit]: %s", alt_hist[:depth])
+            logging.debug("mtp depth %d%s: %d steps, accepted-draft histogram %s", depth, " tree" if tree else "", sum(accept_hist), accept_hist)
+            logging.debug("mtp runner-up %s [break position][miss, hit]: %s", "siblings" if tree else "probe", alt_hist[:depth])
             drop_draft_graph()
             if pinned:
                 comfy.model_prefetch.cleanup_prefetched_modules(None, pinned)
