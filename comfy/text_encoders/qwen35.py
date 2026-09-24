@@ -19,7 +19,6 @@ import comfy.text_encoders.qwen_vl
 
 from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVBias, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
 
-MARGIN_LOG = os.environ.get("COMFY_MTP_MARGIN_LOG") == "1"  # TEMP
 
 @dataclass
 class LinearKV(FixedKV):
@@ -1141,11 +1140,6 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 row = path[-1]
                 commit = tuple(dr[r] for r in path[1:]) + (t[row],)
                 next_tok = am[:, row:row + 1]
-                if MARGIN_LOG:  # TEMP: top-2 logit margin of every committed argmax
-                    v2, i2 = lg[0].float().topk(2, dim=-1)
-                    for k, r in enumerate(path):
-                        logging.info("MARGIN out=%d row=%d top=%d/%.3f second=%d/%.3f margin=%.4f", pos + k, r,
-                                     i2[r, 0].item(), v2[r, 0].item(), i2[r, 1].item(), v2[r, 1].item(), (v2[r, 0] - v2[r, 1]).item())
             else:
                 drafts = toks[1:]
                 dr, corr, accepted = verify_sample(lg, drafts)
