@@ -1302,6 +1302,9 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
             # Relayout into the decode kernel's read order so each weight is one linear
             # region for the prefetch ring (comfy.model_prefetch). Checkpoints stay canonical.
             weight, params = layout_cls.decode_layout(weight, params, comfy.model_management.get_torch_device())
+            logging.info("RINGDBG load %s dev=%s fp=%s rows=%s shape=%s", layer_name, weight.device, module._full_precision_mm, params.stream_rows, tuple(weight.shape))
+        else:
+            logging.info("RINGDBG load %s fmt=%s fp=%s SKIP", layer_name, module.quant_format, module._full_precision_mm)
         module.weight = torch.nn.Parameter(
             QuantizedTensor(weight, module.layout_type, params),
             requires_grad=False,
