@@ -49,15 +49,21 @@ def distribution(logits, recent, block_end, phase, temperature, top_p, top_k, re
     if temperature == 0:
         return scores.max(-1, keepdim=True)
     scores /= temperature
-    # Only the top-k candidates can be sampled; topk returns them sorted descending, which is
-    # the order top-p filtering needs.
-    values, indices = scores.topk(min(top_k, scores.shape[-1]))
+    # Filter a candidate slice instead of the full vocabulary, keeping the full-vocab result: top-k
+    # keeps every token tied with the k-th score (bf16 logits tie often) and ties rank by vocab
+    # index like a stable descending sort of the whole vocabulary.
+    top_k = min(top_k, scores.shape[-1])
+    values, indices = scores.topk(min(2 * top_k, scores.shape[-1]))
+    indices, order = indices.sort()
+    values = values.gather(-1, order)
+    ranked, order = values.sort(descending=True, stable=True)
+    ranked.masked_fill_(ranked < ranked[..., top_k - 1, None], -torch.inf)
     if top_p < 1:
-        probabilities = values.softmax(-1)
+        probabilities = ranked.softmax(-1)
         removed = probabilities.cumsum(-1) - probabilities > top_p
         removed[..., :3 if legacy_off else 1] = False
-        values.masked_fill_(removed, -torch.inf)
-    return values, indices
+        ranked.masked_fill_(removed, -torch.inf)
+    return values.scatter(-1, order, ranked), indices
 
 
 def chunk_ranges(frames, prefix_tokens, context=CONTEXT):
@@ -186,8 +192,12 @@ class YuE2TEModel(torch.nn.Module):
             if sampling["temperature"] == 0:
                 next_id = indices
             else:
-                probabilities = values.softmax(-1).to(rng_device)
-                next_id = indices.gather(-1, torch.multinomial(probabilities, 1, generator=generator).to(device))
+                # torch.multinomial(p, 1) is argmax(p / q) with q ~ Exp(1) drawn for every vocab entry;
+                # drawing the same noise keeps a seed picking the token full-vocab sampling would.
+                probabilities = values.softmax(-1)
+                noise = torch.empty(guided.shape, device=rng_device, dtype=probabilities.dtype).exponential_(generator=generator)
+                chosen = (probabilities.to(rng_device) / noise.gather(-1, indices.to(rng_device))).argmax(-1, keepdim=True)
+                next_id = indices.gather(-1, chosen.to(device))
             decode_tokens.copy_(next_id)
             tokens.index_copy_(0, step_index.view(1), next_id.view(1))
             recent.scatter_(1, (step_index % penalty_window).view(1, 1), next_id)
