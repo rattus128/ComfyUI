@@ -261,6 +261,7 @@ def cleanup_prefetch_queues():
                 cleanup_prefetched_modules(prefetched_module, comfy_modules)
     for module in PREFETCH_RING_MODULES:
         del module._prefetch_ring
+    PREFETCH_RING_MODULES.clear()
     PREFETCH_QUEUES = []
     GRAPH_WARMED_MODULES.clear()
     if MALLOC_GRAPH_USED:
