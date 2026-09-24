@@ -185,6 +185,17 @@ class YuE2TEModel(torch.nn.Module):
         block_end = torch.tensor(min_tokens > 0, device=device)
         step_index = torch.zeros((), device=device, dtype=torch.long)
         tokens = torch.empty((max_tokens,), device=device, dtype=torch.long)
+        # TEMP teacher forcing / logits probe for A/B numerics (YUE_TF_TOKENS, YUE_TF_OUT)
+        tf_out = os.environ.get("YUE_TF_OUT")
+        forced = None
+        if os.environ.get("YUE_TF_TOKENS") and phase == "semantic":
+            forced = torch.full((max_tokens,), end, device=device, dtype=torch.long)
+            ref = torch.load(os.environ["YUE_TF_TOKENS"])["tokens"]
+            forced[:len(ref)] = ref.to(device)
+        tf_top1 = torch.zeros((max_tokens,), device=device, dtype=torch.long)
+        tf_margin = torch.zeros((max_tokens,), device=device)
+        tf_probe = torch.zeros((max_tokens, 64), device=device)
+        probe_idx = torch.arange(0, logits.shape[-1], logits.shape[-1] // 64, device=device)[:64]
 
         def head():
             guided = logits if cfg_scale == 1.0 else logits[1:] + cfg_scale * (logits[:1] - logits[1:])
@@ -198,6 +209,14 @@ class YuE2TEModel(torch.nn.Module):
                 noise = torch.empty(guided.shape, device=rng_device, dtype=probabilities.dtype).exponential_(generator=generator)
                 chosen = (probabilities.to(rng_device) / noise.gather(-1, indices.to(rng_device))).argmax(-1, keepdim=True)
                 next_id = indices.gather(-1, chosen.to(device))
+            if tf_out:
+                l = logits[0].float()
+                v, i = l.topk(2)
+                tf_top1.index_copy_(0, step_index.view(1), i[:1])
+                tf_margin.index_copy_(0, step_index.view(1), (v[0] - v[1]).view(1))
+                tf_probe.index_copy_(0, step_index.view(1), l[probe_idx].view(1, -1))
+            if forced is not None:
+                next_id = forced.index_select(0, step_index.view(1)).view(1, 1)
             decode_tokens.copy_(next_id)
             tokens.index_copy_(0, step_index.view(1), next_id.view(1))
             recent.scatter_(1, (step_index % penalty_window).view(1, 1), next_id)
@@ -252,6 +271,10 @@ class YuE2TEModel(torch.nn.Module):
         finally:
             # Each phase has different KV buffers and may change the CFG batch size.
             comfy.model_prefetch.cleanup_prefetch_queues()
+            if tf_out and phase == "semantic":
+                n = len(history)
+                torch.save({"tokens": tokens[:n].cpu(), "top1": tf_top1[:n].cpu(), "margin": tf_margin[:n].cpu(), "probe": tf_probe[:n].cpu()}, tf_out)
+                logging.info("YUE_TF saved %d steps to %s", n, tf_out)
         logging.warning("YuE2 %s reached its token budget before the end token.", phase)
         return history, True
 
