@@ -974,12 +974,14 @@ class Llama2_(nn.Module):
         caches = []
         flash = getattr(comfy_kitchen, "flash_attention_decode_is_available", None)
         flash_kv = self.fixed_kv and flash is not None and flash(device)
+        if flash_kv:
+            # the layers advance in lockstep: one write position/length pair, prepared once per step
+            pos = torch.empty((batch,), device=device, dtype=torch.int64)
+            seqlen = torch.zeros((batch,), device=device, dtype=torch.int32)
         for _ in range(self.config.num_hidden_layers):
             if flash_kv:
                 key = torch.empty((batch, capacity, self.config.num_key_value_heads, self.config.head_dim), device=device, dtype=dtype)
                 value = torch.empty_like(key)
-                pos = torch.empty((batch,), device=device, dtype=torch.int64)
-                seqlen = torch.zeros((batch,), device=device, dtype=torch.int32)
                 caches.append(FixedKV(key, value, 0, pos, seqlen))
             else:
                 key = torch.empty((batch, self.config.num_key_value_heads, capacity, self.config.head_dim), device=device, dtype=dtype)
@@ -1013,8 +1015,9 @@ class Llama2_(nn.Module):
         if past_key_values is not None and len(past_key_values) > 0:
             past_len = self.get_past_len(past_key_values)
         fixed_kv = past_key_values is not None and len(past_key_values) > 0 and isinstance(past_key_values[0], FixedKV)
-        # Plain FixedKV.prepare only advances device state, so it can replay inside the layer graph.
-        # Subclass prepares carry host-side step data and must run eagerly each step.
+        # Plain FixedKV caches share one position/seqlen (init_kv_cache) and prepare only advances
+        # that device state, so the first layer's graph prepares the step for every layer.
+        # Subclass prepares carry host-side step data and must run eagerly for each layer.
         graph_prepare = fixed_kv and type(past_key_values[0]) is FixedKV
         fixed_kv_decode = fixed_kv and past_len > 0 and seq_len == 1
         if fixed_kv_decode:
@@ -1087,7 +1090,7 @@ class Llama2_(nn.Module):
 
             def core():
                 nonlocal x
-                if graph_prepare:
+                if graph_prepare and i == 0:
                     past_kv.prepare(seq_len)
                 output, current_kv = layer(
                     x=x,
