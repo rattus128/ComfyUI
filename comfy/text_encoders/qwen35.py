@@ -928,7 +928,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             # free inside torch API calls so the allocator's benign notices stay catchable
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                for t in (draft_state.get("d"), draft_state.get("r"), *draft_state.get("keep", ())):
+                for t in (draft_state.get("d"), draft_state.get("d2"), draft_state.get("r"), *draft_state.get("keep", ())):
                     if t is not None:
                         t.set_()
                 g = draft_state.pop("graph", None)
@@ -956,6 +956,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 n1, r1 = self.mtp(self.model.embed_tokens(ds["tok"]).to(dt), ds["hid"], ds["f"], mtp_kv)
                 lg1 = self.logits(n1)
                 ds["d"] = lg1[:, -1].argmax(dim=-1, keepdim=True)
+                ds["d2"] = lg1[:, -1].topk(2, dim=-1).indices[:, 1:]  # runner-up draft (tree-drafting probe)
                 ds["r"] = r1
                 ds["keep"] = (n1, lg1)  # captured allocations must outlive the graph
             ds["graph"] = g
@@ -967,14 +968,15 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             if not use_graph:
                 n1, r1 = self.mtp(self.model.embed_tokens(token).to(dt), hidden, f, mtp_kv)
                 mtp_kv.advance(1)
-                return self.logits(n1)[:, -1].argmax(dim=-1, keepdim=True), r1
+                lg1 = self.logits(n1)[:, -1]
+                return lg1.argmax(dim=-1, keepdim=True), r1, lg1.topk(2, dim=-1).indices[:, 1:]
             ds = draft_state
             ds["tok"].copy_(token)
             ds["hid"].copy_(hidden)
             ds["f"].copy_(f)
             ds["graph"].replay()
             mtp_kv.advance(1)
-            return ds["d"], ds["r"]
+            return ds["d"], ds["r"], ds["d2"]
 
         def verify_sample(lg, drafts):
             # accept draft i w.p. p_i(draft), else sample the residual; all depth+1 columns as one batch
@@ -1009,12 +1011,15 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             # scoped so every temporary dies before the compiler bracket closes
             nonlocal pos
             drafts = []
+            alts = []
             tok_in, hid_in = nt_buf, h_buf
             for k in range(depth):
-                dk, rk = draft(tok_in, hid_in, pos + k)
+                dk, rk, ak = draft(tok_in, hid_in, pos + k)
                 if k < depth - 1:
                     dk = dk.clone()  # later replays overwrite the static output
+                    ak = ak.clone()
                 drafts.append(dk)
+                alts.append(ak)
                 tok_in, hid_in = dk, rk
             ev = self.model.embed_tokens(torch.cat([nt_buf] + drafts, dim=1)).to(dt)
             x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers)
@@ -1022,11 +1027,14 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             lg = verify_logits(x)
             if sampling is None:
                 toks = lg.argmax(dim=-1)
-                vals = torch.cat([toks[0]] + [d[0] for d in drafts]).tolist()
-                t, dr = vals[:depth + 1], vals[depth + 1:]
+                vals = torch.cat([toks[0]] + [d[0] for d in drafts] + [a[0] for a in alts]).tolist()
+                t, dr, al = vals[:depth + 1], vals[depth + 1:2 * depth + 1], vals[2 * depth + 1:]
                 accepts = 0
                 while accepts < depth and t[accepts] == dr[accepts]:
                     accepts += 1
+                if accepts < depth:
+                    # tree-drafting probe: would the runner-up draft at the break position have been the correction?
+                    alt_hist[accepts][al[accepts] == t[accepts]] += 1
                 next_toks = tuple(toks[:, i:i + 1] for i in range(depth + 1))
                 commit = tuple(dr[:accepts]) + (t[accepts],)
             else:
@@ -1055,6 +1063,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         DRAFT_SURVIVAL = 0.15
         probe = None if fixed_depth is not None else 64  # steps of the depth-3 probe
         accept_hist = [0] * 6  # steps by number of accepted drafts
+        alt_hist = [[0, 0] for _ in range(6)]  # [break position][runner-up == correction] (tree-drafting probe)
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)
@@ -1093,6 +1102,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         finally:
             console.close()
             logging.debug("mtp depth %d: %d steps, accepted-draft histogram %s", depth, sum(accept_hist), accept_hist)
+            logging.debug("mtp runner-up probe [break position][miss, hit]: %s", alt_hist[:depth])
             drop_draft_graph()
             if pinned:
                 comfy.model_prefetch.cleanup_prefetched_modules(None, pinned)
