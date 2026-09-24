@@ -40,22 +40,20 @@ def _prefetch_ring_regions(module, seq_len):
     so every weight is one linear region. None while a weight is not VBAR-resident."""
     regions = []
     for s in module.modules():
-        weight = getattr(s, "weight", None)
-        if not isinstance(weight, QuantizedTensor):
+        if not isinstance(getattr(s, "weight", None), QuantizedTensor):
             continue
-        params = weight._params
+        weight = getattr(s, "_v_weight", None)
+        if weight is None:
+            return None
         if weight._layout_cls == "AsymW4A8Int8Layout":
-            if not params.stream_rows or seq_len > 8:
+            if not weight._params.stream_rows or seq_len > 8:
                 continue
         elif weight._layout_cls == "TensorWiseINT8Layout":
             if seq_len > 2 or weight.shape[1] % 16:
                 continue
         else:
             continue
-        resident = getattr(s, "_v_weight", None)
-        if resident is None:
-            return None
-        regions.append((resident._qdata.data_ptr(), resident._qdata.numel() * resident._qdata.element_size()))
+        regions.append((weight._qdata.data_ptr(), weight._qdata.numel() * weight._qdata.element_size()))
     return regions
 
 
