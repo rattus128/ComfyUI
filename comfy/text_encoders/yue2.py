@@ -191,7 +191,8 @@ class YuE2TEModel(torch.nn.Module):
         if os.environ.get("YUE_TF_TOKENS") and phase == "semantic":
             forced = torch.full((max_tokens,), end, device=device, dtype=torch.long)
             ref = torch.load(os.environ["YUE_TF_TOKENS"])["tokens"]
-            forced[:len(ref)] = ref.to(device)
+            n = min(len(ref), max_tokens)
+            forced[:n] = ref[:n].to(device)
         tf_top1 = torch.zeros((max_tokens,), device=device, dtype=torch.long)
         tf_margin = torch.zeros((max_tokens,), device=device)
         tf_probe = torch.zeros((max_tokens, 64), device=device)
