@@ -951,6 +951,8 @@ def _swiglu_eager(x):
     return torch.nn.functional.silu(gate).mul_(up)
 
 
+_W4A8_ACT_EAGER = __import__("os").environ.get("COMFY_W4A8_ACT_EAGER") == "1"  # TEMP A/B
+
 INPUT_ACT_EAGER = {
     "gelu_tanh": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
     "swiglu": _swiglu_eager,
@@ -1011,6 +1013,9 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
             layout = get_layout_class("AsymW4A8Int8Layout")
             qdata, s_rel, s_channel, correction, codebook = layout.get_plain_tensors(weight)
             params = weight._params
+            if _W4A8_ACT_EAGER:  # TEMP A/B: apply the act eagerly, quantizer sees a plain input
+                x = _eager_input_act(x, input_act, act_weight, act_eps)
+                input_act, act_weight, act_eps = None, None, 0.0
             return _residual_out(quant_ops.ck.w4a8_int8_linear(
                 x, qdata, s_rel, s_channel, codebook=codebook, correction=correction,
                 bias=bias, group_size=params.group_size,
