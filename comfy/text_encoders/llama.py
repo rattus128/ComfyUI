@@ -54,14 +54,9 @@ class FixedKVBias(FixedKV):
         if num_tokens <= rows:
             torch.arange(i, i + rows, out=self.position)
             if self.bias is None:
-                if tree:
-                    # tree verify of 2d + 1 rows: the chain rows 0..d run the staircase over
-                    # slots < i + d + 1; sibling row d + k sees chain slots < i + k (staircase
-                    # with kv length i + d) plus itself (decode_tree)
-                    self.seqlen.fill_(i + tree + 1)
-                    self.tracker["sib_seqlen"].fill_(i + tree)
-                else:
-                    self.seqlen.fill_(i + num_tokens)
+                # a tree verify attends the committed prefix (< i) in the flash pass and folds
+                # each row's ancestors in afterwards (decode_tree); a chain runs the staircase
+                self.seqlen.fill_(i if tree is not None and num_tokens == tree.rows else i + num_tokens)
                 return
             window = self.tracker[num_tokens]
             start = i - rows + 1
@@ -76,10 +71,9 @@ class FixedKVBias(FixedKV):
         # all layers advance in lockstep, so the bias caches share one position/seqlen/bias/tracker
         rows = 8
         position = torch.empty((rows,), device=device, dtype=torch.int64)
-        tracker = {"step": -1, "tree": 0}  # tree: d of a tree verify (2d + 1 rows), 0 for a chain verify
+        tracker = {"step": -1, "tree": None}  # tree: the VerifyTree of a tree verify, None for a chain
         flash = getattr(comfy_kitchen, "flash_attention_decode_gqa_is_available", None)
         if head_dim == 256 and flash is not None and flash(device):
-            tracker["sib_seqlen"] = torch.zeros((batch,), device=device, dtype=torch.int32)
             return position, torch.zeros((batch,), device=device, dtype=torch.int32), None, tracker
         bias = torch.full((1, 1, rows, capacity), torch.finfo(dtype).min, device=device, dtype=dtype)
         # window templates per decode width: row r serves query j = r - (rows - n) and may see slots <= index + j
@@ -102,29 +96,19 @@ class FixedKVBias(FixedKV):
         self.value[:, :, self.index:self.index + seq] = xv
         return self.key[:, :, :self.index + seq], self.value[:, :, :self.index + seq]
 
-    def commit_sibling(self, base, accepts, depth):
-        # the accepted sibling (verify slot depth + 1 + accepts) becomes token accepts + 1
-        src, dst = base + depth + 1 + accepts, base + accepts + 1
-        self.key[:, :, dst] = self.key[:, :, src]
-        self.value[:, :, dst] = self.value[:, :, src]
+    def commit_path(self, base, path):
+        # the accepted tree rows path[1:] become tokens 1.. after the root at base; a row never
+        # sits above its depth, so ascending copies never clobber a later source
+        for k, r in enumerate(path[1:], 1):
+            if r != k:
+                self.key[:, :, base + k] = self.key[:, :, base + r]
+                self.value[:, :, base + k] = self.value[:, :, base + r]
 
-    def decode_tree(self, xq, xk, xv, num_kv_heads, d):
-        # rows 0..d are the draft chain, row d + k the runner-up sibling of chain row k: it attends
-        # the chain slots < index + k through the staircase with kv length index + d, plus itself,
-        # merged through the log-sum-exp of the flash pass
-        batch_size, num_heads, _, head_dim = xq.shape
-        chain = comfy_kitchen.flash_attention_decode_gqa(xq[:, :, :d + 1], self.key, self.value, self.seqlen)
-        q_sib = xq[:, :, d + 1:]
-        out, lse = comfy_kitchen.flash_attention_decode_gqa(q_sib, self.key, self.value, self.tracker["sib_seqlen"], return_lse=True)
-        groups = num_heads // num_kv_heads
-        k_sib = xk[:, :, d + 1:].repeat_interleave(groups, dim=1)
-        v_sib = xv[:, :, d + 1:].repeat_interleave(groups, dim=1).permute(0, 2, 1, 3).float()  # [B, d, H, D]
-        s = (q_sib.float() * k_sib.float()).sum(-1) * head_dim ** -0.5  # [B, H, d]
-        m = torch.maximum(lse, s)
-        w_flash = (lse - m).exp().permute(0, 2, 1).unsqueeze(-1)  # [B, d, H, 1]
-        w_self = (s - m).exp().permute(0, 2, 1).unsqueeze(-1)
-        merged = (out.view(batch_size, d, num_heads, head_dim).float() * w_flash + v_sib * w_self) / (w_flash + w_self)
-        return torch.cat([chain, merged.to(xq.dtype).reshape(batch_size, d, num_heads * head_dim)], dim=1)
+    def decode_tree(self, xq, xk, xv, tree):
+        # every row attends the committed prefix in the flash pass (seqlen = index), then its
+        # own ancestors and itself (tree.mask) are folded in through the pass's log-sum-exp
+        out, lse = comfy_kitchen.flash_attention_decode_gqa(xq, self.key, self.value, self.seqlen, return_lse=True, causal=False)
+        return comfy_kitchen.flash_attention_decode_tree_merge(out, lse, xq, xk, xv, tree.mask, torch.empty_like(out))
 
     def decode(self, xq, xk, xv, num_kv_heads):
         # CUDA-graphable: device-side write position, masked attention over the full capacity
@@ -132,10 +116,10 @@ class FixedKVBias(FixedKV):
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
         tree = self.tracker["tree"]
-        if tree and seq == 2 * tree + 1:
+        if tree is not None and seq == tree.rows:
             if self.bias is not None:
                 raise RuntimeError("tree verify requires the kitchen GQA decode kernel")
-            return self.decode_tree(xq, xk, xv, num_kv_heads, tree)
+            return self.decode_tree(xq, xk, xv, tree)
         if self.bias is None:
             return comfy_kitchen.flash_attention_decode_gqa(xq, self.key, self.value, self.seqlen)
         groups = num_heads // num_kv_heads

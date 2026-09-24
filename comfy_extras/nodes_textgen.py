@@ -40,7 +40,7 @@ class TextGenerate(io.ComfyNode):
                 io.DynamicCombo.Input("sampling_mode", options=sampling_options, display_name="Sampling Mode"),
                 io.Boolean.Input("thinking", optional=True, default=False, tooltip="Operate in thinking mode if the model supports it."),
                 io.Boolean.Input("use_default_template", optional=True, default=True, tooltip="Use the built in system prompt/template if the model has one.", advanced=True),
-                io.Combo.Input("mtp", options=["auto", "off", "2", "3", "4", "5", "tree1", "tree2", "tree3"], default="auto", optional=True, tooltip="Speculative decoding with the checkpoint's multi-token-prediction head. No effect without MTP weights. auto adapts the draft depth; 2-5 pins it. Sampled output stays correctly distributed but differs from non-MTP output for the same seed."),
+                io.Combo.Input("mtp", options=["auto", "off", "2", "3", "4", "5", "tree1", "tree2", "tree3", "sym7", "sym8", "tree2s2"], default="auto", optional=True, tooltip="Speculative decoding with the checkpoint's multi-token-prediction head. No effect without MTP weights. auto adapts the draft depth; 2-5 pins it. Sampled output stays correctly distributed but differs from non-MTP output for the same seed."),
             ],
             outputs=[
                 io.String.Output(display_name="generated_text"),
@@ -50,7 +50,7 @@ class TextGenerate(io.ComfyNode):
     @classmethod
     def execute(cls, clip, prompt, max_length, sampling_mode, image=None, thinking=False, use_default_template=True, video=None, audio=None, mtp="auto") -> io.NodeOutput:
 
-        mtp = False if mtp == "off" else (True if mtp == "auto" else (mtp if mtp.startswith("tree") else int(mtp)))
+        mtp = False if mtp == "off" else (True if mtp == "auto" else (mtp if not mtp.isdigit() else int(mtp)))
 
         tokens = clip.tokenize(prompt, image=image, skip_template=not use_default_template, min_length=1, thinking=thinking, video=video, audio=audio)
 
