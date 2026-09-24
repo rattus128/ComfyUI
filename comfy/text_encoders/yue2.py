@@ -11,6 +11,7 @@ import comfy.model_management
 import comfy.model_prefetch
 import comfy.ops
 import comfy.utils
+import comfy_kitchen.flash_attention
 from comfy.ldm.yue2.model import model_config
 from comfy.text_encoders.llama import FixedKV, Llama2_, rope_matrix
 
@@ -119,6 +120,8 @@ class YuE2TEModel(torch.nn.Module):
         self.model.graph_dynamic_vbar_blocks = True
         # A/B test scaffold: COMFY_PREFETCH_RING=0 disables the ring
         self.model.prefetch_ring_enabled = os.environ.get("COMFY_PREFETCH_RING", "1") != "0"
+        # TEMP A/B knob: YUE_FUSED_COMBINE=0 restores the two-launch split-KV combine
+        comfy_kitchen.flash_attention.fused_combine = os.environ.get("YUE_FUSED_COMBINE", "1") != "0"
         self.dtypes = {dtype}
         self.execution_device = device
 

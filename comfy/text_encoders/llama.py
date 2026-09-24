@@ -695,9 +695,12 @@ class Attention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         sliding_window: Optional[int] = None,
         norm: Optional[RMSNorm] = None,
+        residual: Optional[torch.Tensor] = None,
+        residual_scale: Optional[torch.Tensor] = None,
     ):
         """norm, when given, is the block's pre-norm applied to hidden_states on the way
-        into the projections (fused into the INT8 activation quantizer where supported)."""
+        into the projections (fused into the INT8 activation quantizer where supported);
+        residual/residual_scale fold the block's residual add into o_proj's epilogue."""
         batch_size, seq_length, _ = hidden_states.shape
 
         if self.merged_qkv:
@@ -712,6 +715,24 @@ class Attention(nn.Module):
             xq = self.q_proj(hidden_states)
             xk = self.k_proj(hidden_states)
             xv = self.v_proj(hidden_states)
+
+        fixed_cache = past_key_value if isinstance(past_key_value, FixedKV) else None
+        if (fixed_cache is not None and seq_length == 1 and fixed_cache.index > 0
+                and self.q_norm is not None and self.k_norm is not None and not comfy.model_management.in_training):
+            # CUDA-graphable decode step: per-head norm, rotary and the cache write in one kernel.
+            matrix = rope_matrix(freqs_cis)
+            if matrix.ndim == 5:
+                matrix = matrix.unsqueeze(0)
+            q_scale = comfy.model_management.cast_to(self.q_norm.scale(), device=xq.device)
+            k_scale = comfy.model_management.cast_to(self.k_norm.scale(), device=xk.device)
+            xq = comfy_kitchen.rms_rope_kv_decode(
+                xq.view(batch_size, self.num_heads, self.head_dim),
+                xk.view(batch_size, self.num_kv_heads, self.head_dim),
+                xv.view(batch_size, self.num_kv_heads, self.head_dim),
+                matrix, q_scale, k_scale, fixed_cache.key, fixed_cache.value, fixed_cache.position, self.q_norm.eps)
+            output = comfy_kitchen.flash_attention_decode(xq.view(batch_size, 1, self.num_heads, self.head_dim), fixed_cache.key, fixed_cache.value, fixed_cache.seqlen)
+            return comfy.ops.linear_input_act(self.o_proj, output.view(batch_size, seq_length, self.inner_size), None,
+                                              residual=residual, residual_scale=residual_scale), fixed_cache
 
         xq = xq.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
         xk = xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -732,7 +753,6 @@ class Attention(nn.Module):
                 xk = self.k_norm(xk)
             xq, xk = apply_rope(xq, xk, freqs_cis=freqs_cis)
 
-        fixed_cache = past_key_value if isinstance(past_key_value, FixedKV) else None
         if fixed_cache is not None:
             xq = xq.transpose(1, 2)
             xk = xk.transpose(1, 2)
@@ -743,7 +763,8 @@ class Attention(nn.Module):
                 fixed_cache.key.scatter_(1, position, xk)
                 fixed_cache.value.scatter_(1, position, xv)
                 output = comfy_kitchen.flash_attention_decode(xq, fixed_cache.key, fixed_cache.value, fixed_cache.seqlen)
-                return self.o_proj(output.view(batch_size, seq_length, self.inner_size)), fixed_cache
+                return comfy.ops.linear_input_act(self.o_proj, output.view(batch_size, seq_length, self.inner_size), None,
+                                                  residual=residual, residual_scale=residual_scale), fixed_cache
 
             if attention_mask is None or attention_mask.ndim < 4:
                 fixed_cache.key[:, :seq_length].copy_(xk)
@@ -787,7 +808,7 @@ class Attention(nn.Module):
 
         gqa_kwargs = {"enable_gqa": True} if self.num_heads != self.num_kv_heads else {}
         output = optimized_attention(xq, xk, xv, self.num_heads, mask=attention_mask, skip_reshape=True, **gqa_kwargs)
-        return self.o_proj(output), present_key_value
+        return comfy.ops.linear_input_act(self.o_proj, output, None, residual=residual, residual_scale=residual_scale), present_key_value
 
 class MLP(nn.Module):
     def __init__(self, config: Llama2Config, device=None, dtype=None, ops: Any = None, intermediate_size=None):
@@ -830,6 +851,8 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config, device=device, dtype=dtype, ops=ops)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=device, dtype=dtype)
+        # unit scale for the residual add fused into o_proj's epilogue (residual + scale * o_proj)
+        self.register_buffer("residual_scale", torch.ones((1,), device=device, dtype=dtype), persistent=False)
 
     def forward(
         self,
@@ -840,8 +863,7 @@ class TransformerBlock(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         output = x
-        # Self Attention
-        residual = x
+        # Self Attention (the residual add rides in o_proj's epilogue)
         x, present_key_value = self.self_attn(
             hidden_states=x,
             attention_mask=attention_mask,
@@ -849,8 +871,9 @@ class TransformerBlock(nn.Module):
             optimized_attention=optimized_attention,
             past_key_value=past_key_value,
             norm=self.input_layernorm,
+            residual=x,
+            residual_scale=comfy.model_management.cast_to(self.residual_scale, x.dtype, x.device),
         )
-        x = residual + x
 
         # MLP
         residual = x
