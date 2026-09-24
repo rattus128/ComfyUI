@@ -43,14 +43,24 @@ class FixedKVBias(FixedKV):
     # [1, 1, rows, capacity] masks the bmm path, its last `seq` rows serving the queries.
     bias: torch.Tensor = None
     tracker: dict = None
+    # MTP draft cache only: the step's tree rows as written by the breadth-first draft levels,
+    # merged into a level's prefix pass the way a verify merges its own rows (decode_tree)
+    side_key: torch.Tensor = None
+    side_value: torch.Tensor = None
 
     def prepare(self, num_tokens):
-        tree = self.tracker["tree"]
-        if self.tracker["step"] == (self.index, num_tokens, tree):
+        tree, level = self.tracker["tree"], self.tracker["level"]
+        if self.tracker["step"] == (self.index, num_tokens, tree, level):
             return
-        self.tracker["step"] = (self.index, num_tokens, tree)
+        self.tracker["step"] = (self.index, num_tokens, tree, level)
         i = self.index
         rows = self.position.shape[0]
+        if level is not None:
+            # a draft level writes tree row n to slot i + n (the argmax chain lands where the next
+            # step's prefix expects it) and attends the committed prefix < i plus its ancestors
+            torch.add(level.rows, i, out=self.position[:num_tokens])
+            self.seqlen.fill_(i)
+            return
         if num_tokens <= rows:
             torch.arange(i, i + rows, out=self.position)
             if self.bias is None:
@@ -71,7 +81,9 @@ class FixedKVBias(FixedKV):
         # all layers advance in lockstep, so the bias caches share one position/seqlen/bias/tracker
         rows = 8
         position = torch.empty((rows,), device=device, dtype=torch.int64)
-        tracker = {"step": -1, "tree": None}  # tree: the VerifyTree of a tree verify, None for a chain
+        # tree: the VerifyTree of a tree verify, None for a chain; level: the DraftLevel of an MTP
+        # draft pass, None for a plain one
+        tracker = {"step": -1, "tree": None, "level": None}
         flash = getattr(comfy_kitchen, "flash_attention_decode_gqa_is_available", None)
         if head_dim == 256 and flash is not None and flash(device):
             return position, torch.zeros((batch,), device=device, dtype=torch.int32), None, tracker
@@ -104,22 +116,27 @@ class FixedKVBias(FixedKV):
                 self.key[:, :, base + k] = self.key[:, :, base + r]
                 self.value[:, :, base + k] = self.value[:, :, base + r]
 
-    def decode_tree(self, xq, xk, xv, tree):
+    def decode_tree(self, xq, k, v, mask):
         # every row attends the committed prefix in the flash pass (seqlen = index), then its
-        # own ancestors and itself (tree.mask) are folded in through the pass's log-sum-exp
+        # own ancestors and itself (mask over the step's rows k/v) are folded in through the
+        # pass's log-sum-exp
+        if self.bias is not None:
+            raise RuntimeError("tree verify requires the kitchen GQA decode kernel")
         out, lse = comfy_kitchen.flash_attention_decode_gqa(xq, self.key, self.value, self.seqlen, return_lse=True, causal=False)
-        return comfy_kitchen.flash_attention_decode_tree_merge(out, lse, xq, xk, xv, tree.mask, torch.empty_like(out))
+        return comfy_kitchen.flash_attention_decode_tree_merge(out, lse, xq, k, v, mask, torch.empty_like(out))
 
     def decode(self, xq, xk, xv, num_kv_heads):
         # CUDA-graphable: device-side write position, masked attention over the full capacity
         batch_size, num_heads, seq, head_dim = xq.shape
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
-        tree = self.tracker["tree"]
+        tree, level = self.tracker["tree"], self.tracker["level"]
+        if level is not None:
+            self.side_key.index_copy_(2, level.rows, xk)
+            self.side_value.index_copy_(2, level.rows, xv)
+            return self.decode_tree(xq, self.side_key, self.side_value, level.mask)
         if tree is not None and seq == tree.rows:
-            if self.bias is not None:
-                raise RuntimeError("tree verify requires the kitchen GQA decode kernel")
-            return self.decode_tree(xq, xk, xv, tree)
+            return self.decode_tree(xq, xk, xv, tree.mask)
         if self.bias is None:
             return comfy_kitchen.flash_attention_decode_gqa(xq, self.key, self.value, self.seqlen)
         groups = num_heads // num_kv_heads

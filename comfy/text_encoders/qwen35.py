@@ -98,6 +98,15 @@ class LinearKV(FixedKV):
         return self.value
 
 
+@dataclass(eq=False)  # identity-compared in the cache tracker's step key
+class DraftLevel:
+    # one breadth-first MTP draft pass: the tree rows drafted (nodes with children at one depth),
+    # as a python list, an index tensor for the MTP cache's side rows and each row's tree mask
+    nodes: list
+    rows: torch.Tensor
+    mask: torch.Tensor
+
+
 class VerifyTree:
     """Shape of one greedy MTP verify step: a tree of draft tokens rooted at the committed next token.
 
@@ -130,18 +139,23 @@ class VerifyTree:
             self.chain = self.children[self.chain][0]
         self.chain = self.depth[self.chain]  # drafts on the argmax chain (= mtp entries it leaves resident)
         self.fanout = max(len(c) for c in self.children)
-        # drafting order: a node with children is drafted from its own token and the MTP hidden of
-        # its parent's draft; later children's subtrees go first so the argmax chain is what stays
-        # in the MTP cache
-        self.drafted = []
-
-        def order(r):
-            if self.children[r]:
-                self.drafted.append(r)
-                for c in reversed(self.children[r]):
-                    order(c)
-
-        order(0)
+        # full attention (kitchen flash_attention_decode_tree_merge): the rows each row attends
+        mask = []
+        for r in range(self.rows):
+            bits, a = 0, r
+            while a >= 0:
+                bits |= 1 << a
+                a = self.parent[a]
+            mask.append(bits)
+        self.mask = torch.tensor(mask, dtype=torch.int32, device=device)
+        # drafting is breadth-first: every node with children at one depth goes through the MTP
+        # head in one pass (its own token, the MTP hidden of its parent's row), so a step costs
+        # one draft pass per level regardless of width
+        self.levels = []
+        for d in range(max(self.depth) + 1):
+            nodes = [r for r in range(self.rows) if self.depth[r] == d and self.children[r]]
+            if nodes:
+                self.levels.append(DraftLevel(nodes, torch.tensor(nodes, dtype=torch.long, device=device), self.mask[nodes]))
         # DeltaNet program (kitchen gated_delta_decode_deferred, tree=1): depth-first with one saved
         # state; leaves run without committing, a node with several non-leaf children saves its
         # state and later non-leaf children restore it
@@ -167,28 +181,21 @@ class VerifyTree:
         run(0, False)
         self.parent_ctl = torch.tensor(self.parent + [-1] * (8 - self.rows), dtype=torch.int32)
         self.prog_ctl = torch.tensor(prog + [0] * (8 - self.rows), dtype=torch.int32)
-        # full attention (kitchen flash_attention_decode_tree_merge): the rows each row attends
-        mask = []
-        for r in range(self.rows):
-            bits, a = 0, r
-            while a >= 0:
-                bits |= 1 << a
-                a = self.parent[a]
-            mask.append(bits)
-        self.mask = torch.tensor(mask, dtype=torch.int32, device=device)
         self.positions = torch.tensor([self.depth], dtype=torch.long, device=device)
 
     @staticmethod
     def spec(name):
         # "treeN": N argmax drafts each with one runner-up sibling; "symN": the root's two children
         # each get an argmax child and a runner-up (7 rows), sym8 chains a third argmax draft;
-        # "tree2s2": two argmax drafts with two runner-up siblings each
+        # "tree2s2": two argmax drafts with two runner-up siblings each; "sym8w": sym7 plus a third root
+        # sibling; "tree2s32": tree2s2 plus a third root sibling
         if name.startswith("tree") and name[4:].isdigit():
             node = []
             for _ in range(int(name[4:])):
                 node = [node, []]
             return node
-        return {"sym7": [[[], []], [[], []]], "sym8": [[[[]], []], [[], []]], "tree2s2": [[[], [], []], [], []]}[name]
+        return {"sym7": [[[], []], [[], []]], "sym8": [[[[]], []], [[], []]], "tree2s2": [[[], [], []], [], []],
+                "sym8w": [[[], []], [[], []], []], "tree2s32": [[[], [], []], [], [], []]}[name]
 
 
 def _qwen35_layer_types(n):
@@ -965,6 +972,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         # repair window: drafting ahead plus a near-full rollback
         mtp_kv = FixedKVBias.zeros(embeds.shape[0], cfg.num_key_value_heads, cap, cfg.head_dim, device, dt,
                                    FixedKVBias.shared(embeds.shape[0], cap, cfg.head_dim, device, dt))
+        mtp_kv.side_key = torch.empty((embeds.shape[0], cfg.num_key_value_heads, 8, cfg.head_dim), device=device, dtype=dt)
+        mtp_kv.side_value = torch.empty_like(mtp_kv.side_key)
         head = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
 
         def verify_logits(x):
@@ -1047,62 +1056,80 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                      and comfy.model_management.NUM_STREAMS > 0
                      and not comfy.model_management.args.disable_cuda_graphs)
         compile_allocations = use_graph and self.model.graph_dynamic_vbar_blocks and comfy.model_prefetch.malloc_graph_enabled(device)
-        draft_state = {}
+        # one captured MTP pass per draft level plus one for refilling a slot ("refill" key)
+        draft_graphs = {}
 
         def drop_draft_graph():
             # free inside torch API calls so the allocator's benign notices stay catchable
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                for t in (draft_state.get("d"), draft_state.get("top"), draft_state.get("r"), *draft_state.get("keep", ())):
-                    if t is not None:
-                        t.set_()
-                g = draft_state.pop("graph", None)
-                if g is not None:
-                    g.reset()
-                draft_state.clear()
+                for ds in draft_graphs.values():
+                    for t in (ds["d"], ds["top"], ds["r"], *ds["keep"]):
+                        if t is not None:
+                            t.set_()
+                    ds["graph"].reset()
+                draft_graphs.clear()
+
+        def mtp_pass(tok, hid, f):
+            # mtp head over the rows of tok [B, L]: lm_head argmax (+ runner-ups) and the pre-norm hidden
+            n1, r1 = self.mtp(self.model.embed_tokens(tok).to(dt), hid, f, mtp_kv)
+            lg1 = verify_logits(n1)
+            return lg1.argmax(dim=-1), lg1.topk(tree.fanout, dim=-1).indices if tree.fanout > 1 else None, r1, (n1, lg1)
 
         def draft_capture():
-            # captured outside the compiler bracket; its static buffers live for the generate
-            ds = draft_state
-            mtp_kv.prepare(1)
-            ds["tok"] = nt_buf.clone()
-            ds["hid"] = h_buf.clone()
-            ds["f"] = freqs_at(pos).clone()
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(2):
-                    n1, r1 = self.mtp(self.model.embed_tokens(ds["tok"]).to(dt), ds["hid"], ds["f"], mtp_kv)
-                    self.logits(n1)[:, -1].argmax(dim=-1, keepdim=True)
-            torch.cuda.current_stream().wait_stream(side)
-            del n1, r1  # freed before the capture, not shadowed inside it
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, capture_error_mode="thread_local"):
-                n1, r1 = self.mtp(self.model.embed_tokens(ds["tok"]).to(dt), ds["hid"], ds["f"], mtp_kv)
-                lg1 = self.logits(n1)
-                ds["d"] = lg1[:, -1].argmax(dim=-1, keepdim=True)
-                ds["top"] = lg1[:, -1].topk(tree.fanout, dim=-1).indices if tree.fanout > 1 else None  # runner-up drafts
-                ds["r"] = r1
-                ds["keep"] = (n1, lg1)  # captured allocations must outlive the graph
-            ds["graph"] = g
+            # captured outside the compiler bracket; static buffers live for the generate
+            for key in [*range(len(tree.levels)), "refill"]:
+                level = tree.levels[key] if key != "refill" else None
+                n = len(level.nodes) if level is not None else 1
+                mtp_kv.tracker["level"] = level
+                mtp_kv.prepare(n)
+                ds = {"tok": nt_buf.repeat(1, n), "hid": h_buf.repeat(1, n, 1), "f": freqs_at(pos, n).clone()}
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        mtp_pass(ds["tok"], ds["hid"], ds["f"])
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, capture_error_mode="thread_local"):
+                    ds["d"], ds["top"], ds["r"], ds["keep"] = mtp_pass(ds["tok"], ds["hid"], ds["f"])  # keep: captured allocations outlive the graph
+                ds["graph"] = g
+                draft_graphs[key] = ds
+            mtp_kv.tracker["level"] = None
 
-        def draft(token, hidden, p):
-            # one drafted token at mtp position p: mtp head + lm_head argmax (+ runner-ups), graph-replayed on cuda
+        def draft_level(k, toks, hids):
+            # breadth-first draft pass k: the level's nodes from their tokens and parent-row hiddens,
+            # all at mtp position index + depth, written to the cache and side rows by row number
+            level = tree.levels[k]
+            mtp_kv.tracker["level"] = level
+            mtp_kv.prepare(len(level.nodes))
+            f = freqs_at(pos + tree.depth[level.nodes[0]])
+            if not use_graph:
+                d, top, r, _ = mtp_pass(torch.cat(toks, dim=1), torch.cat(hids, dim=1), f.expand(-1, -1, len(level.nodes), *f.shape[3:]))
+                return d, top, r
+            ds = draft_graphs[k]
+            for i, (t, h) in enumerate(zip(toks, hids)):
+                ds["tok"][:, i:i + 1].copy_(t)
+                ds["hid"][:, i:i + 1].copy_(h)
+            ds["f"].copy_(f)
+            ds["graph"].replay()
+            return ds["d"], ds["top"], ds["r"]
+
+        def refill(token, hidden, p):
+            # re-draft one token at mtp slot p (plain staircase attention) so the cache holds every committed token
+            mtp_kv.tracker["level"] = None
             mtp_kv.index = p
             mtp_kv.prepare(1)
             f = freqs_at(p)
             if not use_graph:
-                n1, r1 = self.mtp(self.model.embed_tokens(token).to(dt), hidden, f, mtp_kv)
-                mtp_kv.advance(1)
-                lg1 = self.logits(n1)[:, -1]
-                return lg1.argmax(dim=-1, keepdim=True), r1, lg1.topk(tree.fanout, dim=-1).indices if tree.fanout > 1 else None
-            ds = draft_state
-            ds["tok"].copy_(token)
-            ds["hid"].copy_(hidden)
-            ds["f"].copy_(f)
-            ds["graph"].replay()
+                mtp_pass(torch.full_like(nt_buf, token), hidden, f)
+            else:
+                ds = draft_graphs["refill"]
+                ds["tok"].fill_(token)
+                ds["hid"].copy_(hidden)
+                ds["f"].copy_(f)
+                ds["graph"].replay()
             mtp_kv.advance(1)
-            return ds["d"], ds["r"], ds["top"]
 
         def verify_sample(lg, drafts):
             # accept draft i w.p. p_i(draft), else sample the residual; all depth+1 columns as one batch
@@ -1140,14 +1167,15 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             # argmax chain is drafted last so its entries stay resident in the mtp cache
             toks = [nt_buf] + [None] * (tree.rows - 1)
             hid = {0: h_buf}
-            for n in tree.drafted:
-                d, r, top = draft(toks[n], hid[n], pos + tree.depth[n])
-                children = tree.children[n]
-                toks[children[0]] = d if n == tree.drafted[-1] else d.clone()  # later replays overwrite the static output
-                for k, c in enumerate(children[1:], 1):
-                    toks[c] = top[:, k:k + 1].clone()
-                for c in children:
-                    hid[c] = r if n == tree.drafted[-1] else r.clone()
+            for k, level in enumerate(tree.levels):
+                d, top, r = draft_level(k, [toks[n] for n in level.nodes], [hid[n] for n in level.nodes])
+                for i, n in enumerate(level.nodes):
+                    children = tree.children[n]
+                    toks[children[0]] = d[:, i:i + 1]
+                    for j, c in enumerate(children[1:], 1):
+                        toks[c] = top[:, i, j:j + 1]
+                    for c in children:
+                        hid[c] = r[:, i:i + 1]
             ev = self.model.embed_tokens(torch.cat(toks, dim=1)).to(dt)
             x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers,
                                          position_ids=tree.positions + pos if tree.fanout > 1 else None)
@@ -1186,7 +1214,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             # into its slot (paired, as a correction is, with the main hidden that predicted it)
             for k, r in enumerate(path[1:], 1):
                 if r != k:
-                    draft(toks[r], x[:, tree.parent[r]:tree.parent[r] + 1, :], pos + k)
+                    refill(dr[r], x[:, tree.parent[r]:tree.parent[r] + 1, :], pos + k)
             mtp_kv.index = pos + len(path)
             nt_buf.copy_(next_tok)
             h_buf.copy_(x[:, row:row + 1, :])
