@@ -65,6 +65,7 @@ if __name__ == "__main__" and args.debug_hang:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, dump_traceback_on_sigint)
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
 import comfy_aimdo.control
 
