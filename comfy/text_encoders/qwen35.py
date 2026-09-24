@@ -1037,18 +1037,14 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             nonlocal pos
             drafts = []
             alts = []
-            hiddens = []
             tok_in, hid_in = nt_buf, h_buf
             for k in range(depth):
                 dk, rk, ak = draft(tok_in, hid_in, pos + k)
                 if k < depth - 1:
                     dk = dk.clone()  # later replays overwrite the static output
                     ak = ak.clone()
-                    if tree:
-                        rk = rk.clone()
                 drafts.append(dk)
                 alts.append(ak)
-                hiddens.append(rk)
                 tok_in, hid_in = dk, rk
             ev = self.model.embed_tokens(torch.cat([nt_buf] + drafts + (alts if tree else []), dim=1)).to(dt)
             x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers,
@@ -1091,8 +1087,9 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             if accepts < depth - 1:
                 mtp_kv.rollback(depth - 1 - accepts)  # mtp entries fed by a rejected draft token
             if sibling:
-                # the mtp entry fed by the rejected chain draft is refilled from its accepted sibling
-                draft(alts[accepts], hiddens[accepts], pos + accepts + 1)
+                # the mtp entry fed by the rejected chain draft is refilled from its accepted sibling,
+                # paired (as a correction token would be) with the main hidden that predicted it
+                draft(alts[accepts], x[:, accepts:accepts + 1, :], pos + accepts + 1)
             nt_buf.copy_(next_tok)
             h_buf.copy_(x[:, row:row + 1, :])
             if penalized:
