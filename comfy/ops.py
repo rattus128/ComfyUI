@@ -287,6 +287,15 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
         weight = params[0]
         bias = params[1]
         if prefetch["signature"] is not None:
+            if isinstance(weight, QuantizedTensor) and not s._full_precision_mm:
+                # Relayout the resident weight into its decode kernel's read order, over its
+                # own qdata + scale bytes, so the prefetch ring streams it as one linear region.
+                qdata, qparams = get_layout_class(weight._layout_cls).decode_layout(weight._qdata, weight._params)
+                if qdata is not weight._qdata:
+                    offset = weight._qdata.data_ptr() - xfer_dest.data_ptr()
+                    dest = xfer_dest[offset:offset + qdata.nbytes].view(qdata.dtype)
+                    dest.copy_(qdata)
+                    weight = QuantizedTensor(dest, weight._layout_cls, qparams)
             s._v_weight = weight
             s._v_bias = bias
         s._v_signature = prefetch["signature"]
@@ -1297,14 +1306,8 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
             raise ValueError(f"Unsupported quantization format: {module.quant_format}")
 
         params = layout_cls.Params(**scales, orig_dtype=compute_dtype, orig_shape=module._orig_shape)
-        weight = weight.to(device=device, dtype=qconfig["storage_t"])
-        compute_device = comfy.model_management.get_torch_device()
-        if module.quant_format == "asym_w4a8_int8" and module.can_use_quantized_matmul(get_disabled_quant_formats(compute_device)):
-            # Relayout into the decode kernel's read order so each weight is one linear
-            # region for the prefetch ring (comfy.model_prefetch). Checkpoints stay canonical.
-            weight, params = layout_cls.decode_layout(weight, params, compute_device)
         module.weight = torch.nn.Parameter(
-            QuantizedTensor(weight, module.layout_type, params),
+            QuantizedTensor(weight.to(device=device, dtype=qconfig["storage_t"]), module.layout_type, params),
             requires_grad=False,
         )
 
