@@ -47,18 +47,17 @@ def distribution(logits, recent, block_end, phase, temperature, top_p, top_k, re
         penalty = repetition_penalty ** counts[..., :-1]
         scores = torch.where(scores < 0, scores * penalty, scores / penalty)
     if temperature == 0:
-        return scores
+        return scores.max(-1, keepdim=True)
     scores /= temperature
-    threshold = scores.topk(min(top_k, scores.shape[-1])).values[..., -1, None]
-    scores.masked_fill_(scores < threshold, -torch.inf)
+    # Only the top-k candidates can be sampled; topk returns them sorted descending, which is
+    # the order top-p filtering needs.
+    values, indices = scores.topk(min(top_k, scores.shape[-1]))
     if top_p < 1:
-        values, indices = scores.sort(descending=True)
         probabilities = values.softmax(-1)
         removed = probabilities.cumsum(-1) - probabilities > top_p
         removed[..., :3 if legacy_off else 1] = False
         values.masked_fill_(removed, -torch.inf)
-        scores = values.scatter(-1, indices, values)
-    return scores
+    return values, indices
 
 
 def chunk_ranges(frames, prefix_tokens, context=CONTEXT):
@@ -183,12 +182,12 @@ class YuE2TEModel(torch.nn.Module):
 
         def head():
             guided = logits if cfg_scale == 1.0 else logits[1:] + cfg_scale * (logits[:1] - logits[1:])
-            scores = distribution(guided, recent, block_end, phase, legacy_off=legacy_off, **sampling)
+            values, indices = distribution(guided, recent, block_end, phase, legacy_off=legacy_off, **sampling)
             if sampling["temperature"] == 0:
-                next_id = scores.argmax(-1, keepdim=True)
+                next_id = indices
             else:
-                probabilities = scores.softmax(-1).to(rng_device)
-                next_id = torch.multinomial(probabilities, 1, generator=generator).to(device)
+                probabilities = values.softmax(-1).to(rng_device)
+                next_id = indices.gather(-1, torch.multinomial(probabilities, 1, generator=generator).to(device))
             decode_tokens.copy_(next_id)
             tokens.index_copy_(0, step_index.view(1), next_id.view(1))
             recent.scatter_(1, (step_index % penalty_window).view(1, 1), next_id)
