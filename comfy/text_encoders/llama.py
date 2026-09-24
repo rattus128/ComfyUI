@@ -996,6 +996,9 @@ class Llama2_(nn.Module):
         if past_key_values is not None and len(past_key_values) > 0:
             past_len = self.get_past_len(past_key_values)
         fixed_kv = past_key_values is not None and len(past_key_values) > 0 and isinstance(past_key_values[0], FixedKV)
+        # Plain FixedKV.prepare only advances device state, so it can replay inside the layer graph.
+        # Subclass prepares carry host-side step data and must run eagerly each step.
+        graph_prepare = fixed_kv and type(past_key_values[0]) is FixedKV
         fixed_kv_decode = fixed_kv and past_len > 0 and seq_len == 1
         if fixed_kv_decode:
             attention_mask = None
@@ -1062,11 +1065,13 @@ class Llama2_(nn.Module):
             if past_key_values is not None:
                 past_kv = past_key_values[i] if len(past_key_values) > 0 else []
 
-            if fixed_kv:
+            if fixed_kv and not graph_prepare:
                 past_kv.prepare(seq_len)
 
             def core():
                 nonlocal x
+                if graph_prepare:
+                    past_kv.prepare(seq_len)
                 output, current_kv = layer(
                     x=x,
                     attention_mask=mask,
