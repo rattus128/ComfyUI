@@ -11,6 +11,7 @@ from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 import comfy.model_prefetch
 import comfy.ops
+import comfy.quant_ops
 import comfy.ldm.common_dit
 import comfy.clip_model
 
@@ -693,12 +694,21 @@ class Attention(nn.Module):
         optimized_attention=None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         sliding_window: Optional[int] = None,
+        norm: Optional[RMSNorm] = None,
     ):
+        """norm, when given, is the block's pre-norm applied to hidden_states on the way
+        into the projections (fused into the INT8 activation quantizer where supported)."""
         batch_size, seq_length, _ = hidden_states.shape
 
         if self.merged_qkv:
-            xq, xk, xv = self.qkv_proj(hidden_states).split((self.inner_size, self.kv_size, self.kv_size), dim=-1)
+            if norm is not None:
+                qkv = comfy.ops.linear_input_act(self.qkv_proj, hidden_states, "rms_norm", norm.scale(), norm.eps)
+            else:
+                qkv = self.qkv_proj(hidden_states)
+            xq, xk, xv = qkv.split((self.inner_size, self.kv_size, self.kv_size), dim=-1)
         else:
+            if norm is not None:
+                hidden_states = norm(hidden_states)
             xq = self.q_proj(hidden_states)
             xk = self.k_proj(hidden_states)
             xv = self.v_proj(hidden_states)
@@ -707,12 +717,20 @@ class Attention(nn.Module):
         xk = xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
         xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        if self.q_norm is not None:
-            xq = self.q_norm(xq)
-        if self.k_norm is not None:
-            xk = self.k_norm(xk)
-
-        xq, xk = apply_rope(xq, xk, freqs_cis=freqs_cis)
+        if self.q_norm is not None and self.k_norm is not None and not comfy.model_management.in_training:
+            # Per-head norm and rotary in one kernel (norm kept in fp32 into the rotation).
+            matrix = rope_matrix(freqs_cis)
+            if matrix.ndim == 5:
+                matrix = matrix.unsqueeze(0)
+            q_scale = comfy.model_management.cast_to(self.q_norm.scale(), device=xq.device)
+            k_scale = comfy.model_management.cast_to(self.k_norm.scale(), device=xk.device)
+            xq, xk = comfy.quant_ops.ck.rms_rope_split_half(xq, xk, matrix, q_scale, k_scale, self.q_norm.eps)
+        else:
+            if self.q_norm is not None:
+                xq = self.q_norm(xq)
+            if self.k_norm is not None:
+                xk = self.k_norm(xk)
+            xq, xk = apply_rope(xq, xk, freqs_cis=freqs_cis)
 
         fixed_cache = past_key_value if isinstance(past_key_value, FixedKV) else None
         if fixed_cache is not None:
@@ -824,20 +842,19 @@ class TransformerBlock(nn.Module):
         output = x
         # Self Attention
         residual = x
-        x = self.input_layernorm(x)
         x, present_key_value = self.self_attn(
             hidden_states=x,
             attention_mask=attention_mask,
             freqs_cis=freqs_cis,
             optimized_attention=optimized_attention,
             past_key_value=past_key_value,
+            norm=self.input_layernorm,
         )
         x = residual + x
 
         # MLP
         residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
+        x = self.mlp(x, norm=self.post_attention_layernorm)
         x = torch.add(residual, x, out=output)
 
         return x, present_key_value
