@@ -19,7 +19,7 @@ from . import qwen_vl
 
 # widest speculative verify (tree rows) the decode caches serve in one step; the kitchen
 # GQA tree merge and DeltaNet deferred kernels (gated_delta_slot_max) take the same bound
-SPEC_ROWS = 16
+SPEC_ROWS = 8
 
 
 @dataclass
@@ -48,24 +48,14 @@ class FixedKVBias(FixedKV):
     # [1, 1, rows, capacity] masks the bmm path, its last `seq` rows serving the queries.
     bias: torch.Tensor = None
     tracker: dict = None
-    # MTP draft cache only: the step's tree rows as written by the breadth-first draft levels,
-    # merged into a level's prefix pass the way a verify merges its own rows (decode_tree)
-    side_key: torch.Tensor = None
-    side_value: torch.Tensor = None
 
     def prepare(self, num_tokens):
-        tree, level = self.tracker["tree"], self.tracker["level"]
-        if self.tracker["step"] == (self.index, num_tokens, tree, level):
+        tree = self.tracker["tree"]
+        if self.tracker["step"] == (self.index, num_tokens, tree):
             return
-        self.tracker["step"] = (self.index, num_tokens, tree, level)
+        self.tracker["step"] = (self.index, num_tokens, tree)
         i = self.index
         rows = self.position.shape[0]
-        if level is not None:
-            # a draft level writes tree row n to slot i + n (the argmax chain lands where the next
-            # step's prefix expects it) and attends the committed prefix < i plus its ancestors
-            torch.add(level.rows, i, out=self.position[:num_tokens])
-            self.seqlen.fill_(i)
-            return
         if num_tokens <= rows:
             torch.arange(i, i + rows, out=self.position)
             if self.bias is None:
@@ -86,9 +76,8 @@ class FixedKVBias(FixedKV):
         # all layers advance in lockstep, so the bias caches share one position/seqlen/bias/tracker
         rows = SPEC_ROWS
         position = torch.empty((rows,), device=device, dtype=torch.int64)
-        # tree: the VerifyTree of a tree verify, None for a chain; level: the DraftLevel of an MTP
-        # draft pass, None for a plain one
-        tracker = {"step": -1, "tree": None, "level": None}
+        # tree: the VerifyTree of a tree verify, None for a chain
+        tracker = {"step": -1, "tree": None}
         flash = getattr(comfy_kitchen, "flash_attention_decode_gqa_is_available", None)
         if head_dim == 256 and flash is not None and flash(device):
             return position, torch.zeros((batch,), device=device, dtype=torch.int32), None, tracker
@@ -135,11 +124,7 @@ class FixedKVBias(FixedKV):
         batch_size, num_heads, seq, head_dim = xq.shape
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
-        tree, level = self.tracker["tree"], self.tracker["level"]
-        if level is not None:
-            self.side_key.index_copy_(2, level.rows, xk)
-            self.side_value.index_copy_(2, level.rows, xv)
-            return self.decode_tree(xq, self.side_key, self.side_value, level.mask)
+        tree = self.tracker["tree"]
         if tree is not None and seq == tree.rows:
             return self.decode_tree(xq, xk, xv, tree.mask)
         if self.bias is None:
