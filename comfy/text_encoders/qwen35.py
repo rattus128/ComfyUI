@@ -17,7 +17,7 @@ from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy import sd1_clip
 import comfy.text_encoders.qwen_vl
 
-from .llama import BaseLlama, BaseGenerate, FixedKV, FixedKVBias, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
+from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVBias, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
 
 
 @dataclass
@@ -37,8 +37,8 @@ class LinearKV(FixedKV):
     proj_buf: torch.Tensor = None
     gates_buf: torch.Tensor = None
     sumsq_buf: torch.Tensor = None
-    ctl: torch.Tensor = None  # int32 device {pending, parity, slot[8], parent[8], prog[8]} (kitchen gated_delta_ctl_ints)
-    ctl_tracker: dict = None  # {"host": pinned int32 [2, 26], "step": last (index, num_tokens) written, "path", "tree"}
+    ctl: torch.Tensor = None  # int32 device {pending, parity, slot[sm], parent[sm], prog[sm]}, sm = kitchen gated_delta_slot_max
+    ctl_tracker: dict = None  # {"host": pinned int32 [2, gated_delta_ctl_ints], "step": last (index, num_tokens) written, "path", "tree"}
     uncommitted: int = 0  # tokens of the last deferred step still to commit (rollback trims it)
 
     @staticmethod
@@ -51,7 +51,7 @@ class LinearKV(FixedKV):
                 "path": None, "tree": None}
 
     def decode_step(self, num_tokens):
-        return self.index > 0 and num_tokens <= 8
+        return self.index > 0 and num_tokens <= SPEC_ROWS
 
     def prepare(self, num_tokens):
         # runs every step outside the layer graphs (a replayed forward skips its Python):
@@ -66,11 +66,12 @@ class LinearKV(FixedKV):
             host = t["host"][t["parity"]]
             host[0] = self.uncommitted
             host[1] = t["parity"]
-            path = t["path"] or range(8)
+            sm = comfy_kitchen.gated_delta_slot_max
+            path = t["path"] or range(sm)
             host[2:2 + len(path)] = torch.tensor(path, dtype=torch.int32)
             tree = t["tree"] if t["tree"] is not None and num_tokens == t["tree"].rows else None
-            host[10:18] = tree.parent_ctl if tree is not None else torch.arange(-1, 7, dtype=torch.int32)
-            host[18:26] = tree.prog_ctl if tree is not None else 0
+            host[2 + sm:2 + 2 * sm] = tree.parent_ctl if tree is not None else torch.arange(-1, sm - 1, dtype=torch.int32)
+            host[2 + 2 * sm:2 + 3 * sm] = tree.prog_ctl if tree is not None else 0
             t["path"] = None
             self.ctl.copy_(host, non_blocking=True)
         self.uncommitted = num_tokens if self.decode_step(num_tokens) else 0
@@ -132,8 +133,8 @@ class VerifyTree:
 
         add(spec, -1)
         self.rows = len(self.parent)
-        if self.rows > 8:
-            raise ValueError("verify tree exceeds 8 rows")
+        if self.rows > SPEC_ROWS:
+            raise ValueError(f"verify tree exceeds {SPEC_ROWS} rows")
         self.chain = 0
         while self.children[self.chain]:
             self.chain = self.children[self.chain][0]
@@ -179,8 +180,9 @@ class VerifyTree:
                 run(c, k > 0)
 
         run(0, False)
-        self.parent_ctl = torch.tensor(self.parent + [-1] * (8 - self.rows), dtype=torch.int32)
-        self.prog_ctl = torch.tensor(prog + [0] * (8 - self.rows), dtype=torch.int32)
+        sm = comfy_kitchen.gated_delta_slot_max
+        self.parent_ctl = torch.tensor(self.parent + [-1] * (sm - self.rows), dtype=torch.int32)
+        self.prog_ctl = torch.tensor(prog + [0] * (sm - self.rows), dtype=torch.int32)
         self.positions = torch.tensor([self.depth], dtype=torch.long, device=device)
 
     @staticmethod
@@ -188,14 +190,16 @@ class VerifyTree:
         # "treeN": N argmax drafts each with one runner-up sibling; "symN": the root's two children
         # each get an argmax child and a runner-up (7 rows), sym8 chains a third argmax draft;
         # "tree2s2": two argmax drafts with two runner-up siblings each; "sym8w": sym7 plus a third root
-        # sibling; "tree2s32": tree2s2 plus a third root sibling
+        # sibling; "tree2s32": tree2s2 plus a third root sibling; "sym13": three root children with
+        # two runner-ups each (full depth-2, fanout 3)
         if name.startswith("tree") and name[4:].isdigit():
             node = []
             for _ in range(int(name[4:])):
                 node = [node, []]
             return node
         return {"sym7": [[[], []], [[], []]], "sym8": [[[[]], []], [[], []]], "tree2s2": [[[], [], []], [], []],
-                "sym8w": [[[], []], [[], []], []], "tree2s32": [[[], [], []], [], [], []]}[name]
+                "sym8w": [[[], []], [[], []], []], "tree2s32": [[[], [], []], [], [], []],
+                "sym13": [[[], [], []], [[], [], []], [[], [], []]]}[name]
 
 
 def _qwen35_layer_types(n):
@@ -585,7 +589,7 @@ class GatedAttention(nn.Module):
 
         # KV cache
         present_key_value = past_key_value
-        if past_key_value is not None and seq_length <= 8 and attention_mask is None:
+        if past_key_value is not None and seq_length <= SPEC_ROWS and attention_mask is None:
             output = past_key_value.decode(xq, xk, xv, self.num_kv_heads)
         else:
             if past_key_value is not None:
@@ -967,12 +971,12 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             embeds = embeds.unsqueeze(0)
         # greedy probes 3 deep, then settles at 2, 3 or 5 by measured draft survival; sampled stays at 2
         depth = fixed_depth if fixed_depth is not None else (3 if sampling is None else 2)
-        cap = embeds.shape[1] + max_length + 7
+        cap = embeds.shape[1] + max_length + SPEC_ROWS - 1
         pkv = self.init_kv_cache(embeds.shape[0], cap, device, dt)
         # repair window: drafting ahead plus a near-full rollback
         mtp_kv = FixedKVBias.zeros(embeds.shape[0], cfg.num_key_value_heads, cap, cfg.head_dim, device, dt,
                                    FixedKVBias.shared(embeds.shape[0], cap, cfg.head_dim, device, dt))
-        mtp_kv.side_key = torch.empty((embeds.shape[0], cfg.num_key_value_heads, 8, cfg.head_dim), device=device, dtype=dt)
+        mtp_kv.side_key = torch.empty((embeds.shape[0], cfg.num_key_value_heads, SPEC_ROWS, cfg.head_dim), device=device, dtype=dt)
         mtp_kv.side_value = torch.empty_like(mtp_kv.side_key)
         head = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
 
@@ -1230,8 +1234,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         # at least ~8% of steps for each token per step it adds: threshold DRAFT_SURVIVAL.
         DRAFT_SURVIVAL = 0.15
         probe = 64 if fixed_depth is None and tree.fanout == 1 else None  # steps of the depth-3 probe
-        accept_hist = [0] * 8  # steps by number of accepted drafts
-        row_hist = [0] * 8  # steps that committed each verify row
+        accept_hist = [0] * SPEC_ROWS  # steps by number of accepted drafts
+        row_hist = [0] * SPEC_ROWS  # steps that committed each verify row
         try:
             if pinned:
                 comfy.model_prefetch.pin_modules(pinned, device, dt)

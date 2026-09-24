@@ -16,6 +16,10 @@ import comfy.clip_model
 
 from . import qwen_vl
 
+# widest speculative verify (tree rows) the decode caches serve in one step; the kitchen
+# GQA tree merge and DeltaNet deferred kernels (gated_delta_slot_max) take the same bound
+SPEC_ROWS = 16
+
 
 @dataclass
 class FixedKV:
@@ -79,7 +83,7 @@ class FixedKVBias(FixedKV):
     @staticmethod
     def shared(batch, capacity, head_dim, device, dtype):
         # all layers advance in lockstep, so the bias caches share one position/seqlen/bias/tracker
-        rows = 8
+        rows = SPEC_ROWS
         position = torch.empty((rows,), device=device, dtype=torch.int64)
         # tree: the VerifyTree of a tree verify, None for a chain; level: the DraftLevel of an MTP
         # draft pass, None for a plain one
@@ -1005,7 +1009,7 @@ class Llama2_(nn.Module):
             mask = 1.0 - attention_mask.to(x.dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])).expand(attention_mask.shape[0], 1, seq_len, attention_mask.shape[-1])
             mask = mask.masked_fill(mask.to(torch.bool), torch.finfo(x.dtype).min / 4)
 
-        spec_decode = fixed_kv and any(isinstance(kv, FixedKVBias) for kv in past_key_values) and 2 <= seq_len <= 8 and past_len > 0 and attention_mask is None
+        spec_decode = fixed_kv and any(isinstance(kv, FixedKVBias) for kv in past_key_values) and 2 <= seq_len <= SPEC_ROWS and past_len > 0 and attention_mask is None
         if seq_len > 1 and not spec_decode:  # spec verify: the staircase decode bias is causal
             causal_mask = torch.empty(past_len + seq_len, past_len + seq_len, dtype=x.dtype, device=x.device).fill_(torch.finfo(x.dtype).min / 4).triu_(1)
             if mask is not None:
