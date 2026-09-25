@@ -1099,6 +1099,11 @@ class Llama2_(nn.Module):
         )
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
+        if fixed_kv and not graph_prepare:
+            # before the layers: replayed layer graphs chain on each other, not on work
+            # enqueued between them (prefetch_queue_pop)
+            for kv in past_key_values:
+                kv.prepare(seq_len)
         for i, layer in enumerate(self.layers):
             if all_intermediate is not None:
                 if only_layers is None or (i in only_layers):
@@ -1107,9 +1112,6 @@ class Llama2_(nn.Module):
             past_kv = None
             if past_key_values is not None:
                 past_kv = past_key_values[i] if len(past_key_values) > 0 else []
-
-            if fixed_kv and not graph_prepare:
-                past_kv.prepare(seq_len)
 
             def core():
                 nonlocal x

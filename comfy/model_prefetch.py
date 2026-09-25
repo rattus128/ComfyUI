@@ -18,6 +18,8 @@ from comfy.quant_ops import QuantizedTensor
 PREFETCH_QUEUES = []
 GRAPH_WARMED_MODULES = weakref.WeakSet()
 GRAPH_CAPTURE_STREAMS = {}
+GRAPH_REPLAY_STREAMS = {}  # device -> the two streams consecutive layer graphs alternate between
+GRAPH_REPLAY_CHAIN = {}  # device -> stream of the last replay, while every pop since it replayed
 MALLOC_GRAPHS = {}
 MALLOC_GRAPH_BREAKS = 0
 MALLOC_GRAPH_ROGUES = 0
@@ -375,9 +377,24 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
         if comfy_modules is not None:
             cleanup_prefetched_modules(prefetched_module, comfy_modules)
 
+    # Consecutive layer graphs alternate two streams, each waiting on the previous replay
+    # directly: back-to-back graph launches on one stream leave a ~5 us bubble at every
+    # boundary, one event hop from another stream ~1.5 us. The current stream is kept
+    # ordered after every replay, but a replay only waits on the current stream when the
+    # chain starts, so callers must not enqueue work on it between replayed pops.
+    current = comfy.model_management.current_stream(device)
+    prev = GRAPH_REPLAY_CHAIN.pop(device, current)
     if graph_hit:
         queue[0] = (None, (module, []))
-        graph["graph"].replay()
+        streams = GRAPH_REPLAY_STREAMS.get(device)
+        if streams is None:
+            streams = GRAPH_REPLAY_STREAMS[device] = [torch.cuda.Stream(device=device) for _ in range(2)]
+        stream = streams[prev is streams[0]]
+        stream.wait_stream(prev)
+        with torch.cuda.stream(stream):
+            graph["graph"].replay()
+        current.wait_stream(stream)
+        GRAPH_REPLAY_CHAIN[device] = stream
         return
     if enable_graph and module is not None:
         # Running outside replay: the layer's weights may land at new addresses, and

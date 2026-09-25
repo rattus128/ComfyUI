@@ -101,10 +101,12 @@ class Decoder(nn.Module):
             x = decode_buffer
         attention = optimized_attention_for_device(x.device, mask=mask is not None or graph, small_input=True)
         queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": True})
+        if fixed:
+            # before the layers: replayed layer graphs chain on each other, not on work
+            # enqueued between them (prefetch_queue_pop)
+            for self_cache, _ in cache:
+                self_cache.prepare(length)
         for i, layer in enumerate(self.layers):
-            if fixed:
-                cache[i][0].prepare(length)
-
             def core():
                 nonlocal x
                 out, cache[i] = layer(x, attention, mask, cache[i])
