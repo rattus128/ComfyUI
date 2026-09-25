@@ -1072,6 +1072,53 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
         uncast_bias_weight(linear, weight, bias, offload_stream)
 
 
+def _streamed_w4a8(linear):
+    weight = linear.weight
+    return (isinstance(weight, QuantizedTensor)
+            and weight._layout_cls == "AsymW4A8Int8Layout"
+            and weight._params.stream_rows
+            and not getattr(weight._params, "transposed", False)
+            and not getattr(linear, "_full_precision_mm", False))
+
+
+def linear_input_act_shared(linears, x, input_act, act_weight=None, act_eps=0.0):
+    """``[linear(act(x)) for linear in linears], act(x)``.
+
+    Several linears over one activated input: when they are all streamed W4A8
+    decode linears, ``act(x)`` is quantized once (kitchen's fused activation
+    quantizer also hands back ``act(x)`` itself) and every GEMM takes the
+    same int8 image; otherwise ``act`` runs eagerly once and each linear runs
+    on its own. ``act(x)`` is returned for consumers that need the activated
+    row beyond the linears.
+
+    """
+    quant = None
+    if not comfy.model_management.in_training and all(_streamed_w4a8(linear) for linear in linears):
+        quant = quant_ops.ck.w4a8_quantize_input(x, input_act, act_weight, act_eps, activated=True)
+    if quant is None:
+        x = _eager_input_act(x, input_act, act_weight, act_eps)
+        return [linear(x) for linear in linears], x
+    xq, xs, x = quant
+    outs = []
+    for linear in linears:
+        weight, bias, offload_stream = cast_bias_weight(linear, x, offloadable=True)
+        try:
+            if not isinstance(weight, QuantizedTensor):
+                outs.append(torch.nn.functional.linear(x, weight, bias))
+                continue
+            layout = get_layout_class("AsymW4A8Int8Layout")
+            qdata, s_rel, s_channel, correction, codebook = layout.get_plain_tensors(weight)
+            params = weight._params
+            out = quant_ops.ck.w4a8_int8_linear_prequantized(
+                xq, xs, qdata, s_channel, params.stream_rows, bias=bias,
+                group_size=params.group_size, convrot_groupsize=params.convrot_groupsize,
+                out_dtype=params.orig_dtype)
+            outs.append(out.reshape(*x.shape[:-1], out.shape[-1]))
+        finally:
+            uncast_bias_weight(linear, weight, bias, offload_stream)
+    return outs, x
+
+
 class QuantLinearFunc(torch.autograd.Function):
     """Custom autograd function for quantized linear: quantized forward, optionally FP8 backward.
 

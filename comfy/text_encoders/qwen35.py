@@ -389,7 +389,7 @@ class GatedDeltaNet(nn.Module):
 
         self.norm = RMSNormGated(self.value_head_dim, eps=config.rms_norm_eps, device=device, dtype=dtype)
 
-    def forward(self, x, past_key_value=None, **kwargs):
+    def forward(self, x, past_key_value=None, norm=None, **kwargs):
         batch_size, seq_len, _ = x.shape
 
         use_recurrent = past_key_value is not None and past_key_value.decode_step(seq_len)
@@ -400,9 +400,14 @@ class GatedDeltaNet(nn.Module):
                      and fused_available(x.device, self.key_head_dim, self.value_head_dim)
                      and (seq_len == 1 or past_key_value.snap_backing is not None))
 
-        # Projections (shared)
+        # Projections (shared); the block's pre-norm rides into the projections' shared
+        # activation quantizer where supported, which also hands back the normed x.
         if self.merged_qkvz:
+            if norm is not None:
+                x = norm(x)
             proj, z = self.in_proj_qkvz(x).split([self.key_dim * 2 + self.value_dim, self.value_dim], dim=-1)
+        elif norm is not None:
+            (proj, z), x = comfy.ops.linear_input_act_shared((self.in_proj_qkv, self.in_proj_z), x, "rms_norm", norm.scale(), norm.eps)
         else:
             proj = self.in_proj_qkv(x)  # [B, seq_len, conv_dim]
             z = self.in_proj_z(x)
@@ -647,7 +652,7 @@ class Qwen35TransformerBlock(nn.Module):
     def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
         output = x
         if self.layer_type == "linear_attention":
-            h, present_key_value = self.linear_attn(self.input_layernorm(x), attention_mask=attention_mask, past_key_value=past_key_value)
+            h, present_key_value = self.linear_attn(x, attention_mask=attention_mask, past_key_value=past_key_value, norm=self.input_layernorm)
         else:
             h, present_key_value = self.self_attn(x, attention_mask=attention_mask, freqs_cis=freqs_cis, optimized_attention=optimized_attention, past_key_value=past_key_value, norm=self.input_layernorm)
 
