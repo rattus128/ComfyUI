@@ -131,9 +131,14 @@ class FixedKVBias(FixedKV):
 
     def decode(self, xq, xk, xv, num_kv_heads):
         # CUDA-graphable: device-side write position, masked attention over the full capacity
-        batch_size, num_heads, seq, head_dim = xq.shape
+        seq = xq.shape[2]
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
+        return self.attend(xq, xk, xv, num_kv_heads)
+
+    def attend(self, xq, xk, xv, num_kv_heads):
+        # this step's rows xk/xv [B, kv heads, seq, D] are already written to the cache
+        batch_size, num_heads, seq, head_dim = xq.shape
         tree = self.tracker["tree"]
         if tree is not None and seq == tree.rows:
             return self.decode_tree(xq, xk, xv, tree.mask)
@@ -720,11 +725,12 @@ class Attention(nn.Module):
                 matrix = matrix.unsqueeze(0)
             q_scale = comfy.model_management.cast_to(self.q_norm.scale(), device=xq.device)
             k_scale = comfy.model_management.cast_to(self.k_norm.scale(), device=xk.device)
-            xq = comfy_kitchen.rms_rope_kv_decode(
-                xq.view(batch_size, self.num_heads, self.head_dim),
-                xk.view(batch_size, self.num_kv_heads, self.head_dim),
-                xv.view(batch_size, self.num_kv_heads, self.head_dim),
-                matrix, q_scale, k_scale, fixed_cache.key, fixed_cache.value, fixed_cache.position, self.q_norm.eps)
+            xq, _ = comfy_kitchen.rms_rope_kv_decode(
+                xq.view(batch_size, 1, self.num_heads, self.head_dim),
+                xk.view(batch_size, 1, self.num_kv_heads, self.head_dim),
+                xv.view(batch_size, 1, self.num_kv_heads, self.head_dim),
+                matrix, q_scale, k_scale, fixed_cache.key.transpose(1, 2), fixed_cache.value.transpose(1, 2),
+                fixed_cache.position.view(batch_size, 1), self.q_norm.eps)
             output = comfy_kitchen.flash_attention_decode(xq.view(batch_size, 1, self.num_heads, self.head_dim), fixed_cache.key, fixed_cache.value, fixed_cache.seqlen)
             return comfy.ops.linear_input_act(self.o_proj, output.view(batch_size, seq_length, self.inner_size), None,
                                               residual=residual, residual_scale=residual_scale), fixed_cache

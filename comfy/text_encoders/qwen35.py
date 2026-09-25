@@ -548,21 +548,36 @@ class GatedAttention(nn.Module):
             qg = self.q_proj(x)
             xk = self.k_proj(x)
             xv = self.v_proj(x)
-        # Split into query and gate: each is [B, seq, inner_size]
+        # Split into query and gate: each is [B, seq, heads, head_dim]
         qg = qg.view(batch_size, seq_length, self.num_heads, self.head_dim * 2)
         xq, gate = qg[..., :self.head_dim], qg[..., self.head_dim:]
-        gate = gate.reshape(batch_size, seq_length, -1)  # [B, seq, inner_size]
+        xk = xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
 
+        # KV cache
+        present_key_value = past_key_value
+        decode = past_key_value is not None and seq_length <= SPEC_ROWS and attention_mask is None
+        if decode and past_key_value.bias is None and comfy_kitchen.rms_rope_kv_decode_is_available(x.device):
+            # per-head norm, partial rotary and the cache write of this step's rows in one kernel
+            matrix = rope_matrix(freqs_cis)
+            if matrix.ndim == 5:
+                matrix = matrix.unsqueeze(0)
+            q_scale = comfy.model_management.cast_to(self.q_norm.scale(), dtype=x.dtype, device=x.device)
+            k_scale = comfy.model_management.cast_to(self.k_norm.scale(), dtype=x.dtype, device=x.device)
+            xq, xk = comfy_kitchen.rms_rope_kv_decode(xq, xk, xv, matrix, q_scale, k_scale, past_key_value.key, past_key_value.value,
+                                                      past_key_value.position[:seq_length].view(1, seq_length), self.q_norm.eps)
+            output = past_key_value.attend(xq, xk, xv.transpose(1, 2), self.num_kv_heads)
+            return self.o_proj((output.view(batch_size, seq_length, self.num_heads, self.head_dim) * gate.sigmoid()).view(batch_size, seq_length, -1)), present_key_value
+
+        gate = gate.reshape(batch_size, seq_length, -1)  # [B, seq, inner_size]
         xq = self.q_norm(xq).transpose(1, 2)  # [B, heads, seq, head_dim]
-        xk = self.k_norm(xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-        xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        xk = self.k_norm(xk).transpose(1, 2)
+        xv = xv.transpose(1, 2)
 
         # Apply partial RoPE
         xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim)
 
-        # KV cache
-        present_key_value = past_key_value
-        if past_key_value is not None and seq_length <= SPEC_ROWS and attention_mask is None:
+        if decode:
             output = past_key_value.decode(xq, xk, xv, self.num_kv_heads)
         else:
             if past_key_value is not None:
