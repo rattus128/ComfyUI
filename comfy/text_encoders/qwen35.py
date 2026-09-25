@@ -182,6 +182,7 @@ def _qwen35_layer_types(n):
 MERGED_PROJECTIONS = (
     ("self_attn.qkv_proj", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
     ("mlp.gate_up_proj", ("mlp.gate_proj", "mlp.up_proj")),
+    ("linear_attn.in_proj_qkvz", ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z")),
 )
 
 
