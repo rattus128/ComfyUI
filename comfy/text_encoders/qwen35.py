@@ -179,6 +179,48 @@ def _qwen35_layer_types(n):
     return [("full_attention" if (i + 1) % 4 == 0 else "linear_attention") for i in range(n)]
 
 
+MERGED_PROJECTIONS = (
+    ("self_attn.qkv_proj", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
+    ("mlp.gate_up_proj", ("mlp.gate_proj", "mlp.up_proj")),
+    ("linear_attn.in_proj_qkvz", ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z")),
+)
+
+
+def merge_projections(state_dict):
+    """Concatenate sibling projections of one input into a single row-major weight, so a
+    decode step issues one GEMM per group and its pre-norm / SwiGLU folds into that GEMM's
+    activation quantizer (see GatedAttention.forward, MLP.forward). Every layout stored here
+    quantizes rows independently: tensors with a leading output-row dimension concatenate, the
+    rest (codebook, comfy_quant, tensorwise scale) must already agree or the group stays split."""
+    for key in list(state_dict.keys()):
+        for merged, members in MERGED_PROJECTIONS:
+            suffix = ".{}.weight".format(members[0])
+            if not key.endswith(suffix):
+                continue
+            prefix = key[:-len(suffix) + 1]
+            bases = [prefix + member for member in members]
+            names = [k[len(bases[0]) + 1:] for k in state_dict if k.startswith(bases[0] + ".")]
+            if any("{}.{}".format(base, name) not in state_dict for base in bases for name in names):
+                continue
+            rows = [state_dict[base + ".weight"].shape[0] for base in bases]
+            out = {}
+            for name in names:
+                parts = [state_dict["{}.{}".format(base, name)] for base in bases]
+                if all(p.ndim > 0 and p.shape[0] == n for p, n in zip(parts, rows)):
+                    out[name] = torch.cat(parts, dim=0)
+                elif all(torch.equal(parts[0], p) for p in parts[1:]):
+                    out[name] = parts[0]
+                else:
+                    break
+            else:
+                for base in bases:
+                    for name in names:
+                        del state_dict["{}.{}".format(base, name)]
+                for name, value in out.items():
+                    state_dict["{}{}.{}".format(prefix, merged, name)] = value
+    return state_dict
+
+
 def detect_merged_config(state_dict):
     return {
         "merged_qkv": "model.layers.3.self_attn.qkv_proj.weight" in state_dict,
