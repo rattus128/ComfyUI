@@ -6,6 +6,7 @@ from tqdm import tqdm
 import contextlib
 import logging
 import os
+import time
 import warnings
 
 import comfy.model_management
@@ -1171,9 +1172,17 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             accepted = (u < p_draft).long().cumprod(0).sum()
             return dr, corr, accepted
 
+        # wip: COMFY_MTP_TIMING=1 logs untraced per-phase step time (drafts, sweep, lm_head, host tail)
+        timing = os.environ.get("COMFY_MTP_TIMING") == "1"
+        phase = {"drafts": 0.0, "sweep": 0.0, "head": 0.0, "host": 0.0, "wall": 0.0, "n": 0}
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)] if timing else None
+
         def step():
             # scoped so every temporary dies before the compiler bracket closes
             nonlocal pos
+            if timing:
+                t_wall = time.perf_counter()
+                ev[0].record()
             # draft the argmax chain, one MTP pass per depth into mtp slots pos, pos + 1, ...; each
             # pass's runner-ups fill the chain node's sibling rows
             toks = [nt_buf] + [None] * (tree.rows - 1)
@@ -1185,14 +1194,22 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 for j, c in enumerate(children[1:], 1):
                     toks[c] = top[:, 0, j:j + 1]
                 hid = r
-            ev = self.model.embed_tokens(torch.cat(toks, dim=1)).to(dt)
-            x, _, _ = self.model.forward(None, embeds=ev, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers,
+            if timing:
+                ev[1].record()
+            emb = self.model.embed_tokens(torch.cat(toks, dim=1)).to(dt)
+            x, _, _ = self.model.forward(None, embeds=emb, attention_mask=None, past_key_values=pkv, decode_buffers=verify_buffers,
                                          position_ids=tree.positions + pos if tree.fanout > 1 else None)
+            if timing:
+                ev[2].record()
             # all verify positions in one lm_head GEMV, accept decided GPU-side, one sync
             lg = verify_logits(x)
             if sampling is None:
                 am = lg.argmax(dim=-1)
+                if timing:
+                    ev[3].record()
                 vals = torch.cat([am[0]] + [t[0] for t in toks[1:]]).tolist()
+                if timing:
+                    t_host = time.perf_counter()
                 t, dr = vals[:tree.rows], [None] + vals[tree.rows:]
                 # walk down the tree while a child holds the node's argmax
                 path = [0]
@@ -1232,6 +1249,13 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                     pen_mask.index_fill_(0, d.reshape(-1), True)
                 pen_mask.index_fill_(0, nt_buf.reshape(-1), True)
             pos += len(commit)
+            if timing and sampling is None:
+                phase["n"] += 1
+                phase["drafts"] += ev[0].elapsed_time(ev[1])
+                phase["sweep"] += ev[1].elapsed_time(ev[2])
+                phase["head"] += ev[2].elapsed_time(ev[3])
+                phase["host"] += (time.perf_counter() - t_host) * 1000
+                phase["wall"] += (time.perf_counter() - t_wall) * 1000
             return path, commit
 
         # A draft costs one MTP block plus one lm_head read (~1.6 GB here against ~14 GB for
@@ -1281,6 +1305,10 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         finally:
             console.close()
             logging.debug("mtp depth %d rows %d: %d steps, accepted-draft histogram %s", depth, tree.rows, sum(accept_hist), accept_hist[:tree.rows])
+            if timing and phase["n"]:
+                n = phase["n"]
+                logging.info("mtp step timing over %d steps (ms/step): drafts %.3f sweep %.3f lm_head+argmax %.3f host-after-sync %.3f wall %.3f",
+                             n, phase["drafts"] / n, phase["sweep"] / n, phase["head"] / n, phase["host"] / n, phase["wall"] / n)
             if tree.fanout > 1:
                 logging.debug("mtp tree parents %s: steps committing each row %s", tree.parent, row_hist[:tree.rows])
             drop_draft_graph()
