@@ -27,6 +27,11 @@ PREFETCH_RING_LOOKAHEAD = int(float(os.environ.get("COMFY_PREFETCH_RING_MIB", "8
 # diagnostics: log the issuer's cumulative counters every N steps (synchronizes the device)
 PREFETCH_RING_STATS_EVERY = int(os.environ.get("COMFY_PREFETCH_RING_STATS_EVERY", "0"))
 PREFETCH_RING_CHUNK = 96 * 1024
+# A/B test scaffold: COMFY_PREFETCH_RING_STATE=kv,delta lists the attention caches whose
+# reading kernels credit the ring (KV rows for flash decode, DeltaNet recurrent state)
+PREFETCH_RING_CREDITS = sum(
+    {"kv": ck.prefetch_ring.CREDIT_KV, "delta": ck.prefetch_ring.CREDIT_DELTA}[name]
+    for name in os.environ.get("COMFY_PREFETCH_RING_STATE", "kv,delta").split(",") if name)
 # Bumped whenever a graphed layer runs outside graph replay (warm-up, capture) or an
 # execution ends: the resident weight addresses the ring was built from may have moved.
 PREFETCH_RING_GENERATION = 0
@@ -34,41 +39,69 @@ ACTIVE_PREFETCH_RING = None
 PREFETCH_RING_MODULES = weakref.WeakSet()
 
 
-def _prefetch_ring_regions(module, seq_len):
-    """(address, bytes) of each weight the step's decode kernels credit to the ring, in
-    forward order. decode_layout stores W4A8 weights in the streamed kernel's read order,
-    so every weight is one linear region. None while a weight is not VBAR-resident."""
+def _prefetch_ring_regions(layers, caches, seq_len):
+    """(address, bytes) of everything the step's decode kernels credit to the ring, in
+    forward order, with the ring credit mask. decode_layout stores W4A8 weights in the
+    streamed kernel's read order, so every weight is one linear region. A layer's attention
+    state (KV rows, DeltaNet recurrent state) is listed ahead of its weights: it is read and
+    credited after the layer's first GEMVs, and a late credit only narrows the window for
+    that stretch, while an early one would let the issuer skip weights. None while a weight
+    is not VBAR-resident."""
     regions = []
-    for s in module.modules():
-        if not isinstance(getattr(s, "weight", None), QuantizedTensor):
-            continue
-        weight = getattr(s, "_v_weight", None)
-        if weight is None:
-            return None
-        if weight._layout_cls == "AsymW4A8Int8Layout":
-            if not weight._params.stream_rows or seq_len > 8:
+    kv_rows = []
+    credits = 0
+    for i, layer in enumerate(layers):
+        cache = caches[i] if caches else None
+        state = cache.prefetch_regions(seq_len) if cache is not None and cache.prefetch_credit & PREFETCH_RING_CREDITS else []
+        if state:
+            credits |= cache.prefetch_credit
+            if cache.prefetch_credit == ck.prefetch_ring.CREDIT_KV:
+                kv_rows.extend(range(len(regions), len(regions) + len(state)))
+            regions.extend(state)
+        for s in layer.modules():
+            if not isinstance(getattr(s, "weight", None), QuantizedTensor):
                 continue
-        elif weight._layout_cls == "TensorWiseINT8Layout":
-            if seq_len > 2 or weight.shape[1] % 16:
+            weight = getattr(s, "_v_weight", None)
+            if weight is None:
+                return None, None, 0
+            if weight._layout_cls == "AsymW4A8Int8Layout":
+                if not weight._params.stream_rows or seq_len > 8:
+                    continue
+            elif weight._layout_cls == "TensorWiseINT8Layout":
+                if seq_len > 2 or weight.shape[1] % 16:
+                    continue
+            else:
                 continue
-        else:
-            continue
-        regions.append((weight._qdata.data_ptr(), weight._qdata.numel() * weight._qdata.element_size()))
-    return regions
+            regions.append((weight._qdata.data_ptr(), weight._qdata.numel() * weight._qdata.element_size()))
+    return regions, kv_rows, credits
 
 
 class CompiledPrefetchRing:
-    def __init__(self, device, key, regions):
+    def __init__(self, device, key, regions, kv_rows, credits):
         self.device = device
         self.key = key
         self.steps = 0
+        self.credits = credits
+        # KV byte counts grow every step: rewritten in a pinned double buffer and copied over
+        # the device list before the issuer starts (start() re-sums the step total)
+        self.kv_rows = None
         with pause_malloc_graph(sync=True):
-            self.descriptors = torch.tensor(regions, dtype=torch.uint64, device=device)
+            self.descriptors = torch.tensor(regions, dtype=torch.int64, device=device)
+            if kv_rows:
+                self.kv_rows = torch.tensor(kv_rows, dtype=torch.int64)
+                self.host = torch.tensor([regions, regions], dtype=torch.int64).pin_memory()
+                self.parity = 0
         self.total = sum(size for _, size in regions)
-        logging.info("Comfy prefetch ring: %d regions (%.2f GiB)", len(regions), self.total / (1024 ** 3))
+        logging.info("Comfy prefetch ring: %d regions (%.2f GiB), credits %d", len(regions), self.total / (1024 ** 3), credits)
 
     def configure(self):
-        ck.configure_prefetch_ring(self.descriptors, len(self.descriptors), PREFETCH_RING_LOOKAHEAD, PREFETCH_RING_CHUNK)
+        ck.configure_prefetch_ring(self.descriptors.view(torch.uint64), len(self.descriptors), PREFETCH_RING_LOOKAHEAD, PREFETCH_RING_CHUNK, self.credits)
+
+    def refresh(self, kv_bytes):
+        self.parity ^= 1
+        host = self.host[self.parity]
+        host[:, 1].index_fill_(0, self.kv_rows, kv_bytes)
+        self.descriptors.copy_(host, non_blocking=True)
 
 
 def _stop_prefetch_ring():
@@ -78,7 +111,7 @@ def _stop_prefetch_ring():
         ACTIVE_PREFETCH_RING = None
 
 
-def prefetch_ring_begin(module, device, seq_len, enabled):
+def prefetch_ring_begin(module, device, seq_len, enabled, caches):
     global ACTIVE_PREFETCH_RING
     if not enabled or not ck.prefetch_ring_is_available():
         return
@@ -89,17 +122,20 @@ def prefetch_ring_begin(module, device, seq_len, enabled):
         # graph), so the resident weights are where _v_weight says they are.
         regions = None
         if getattr(module, "_prefetch_ring_seen", None) == key:
-            regions = _prefetch_ring_regions(module, seq_len)
+            regions, kv_rows, credits = _prefetch_ring_regions(module, caches, seq_len)
         module._prefetch_ring_seen = key
         if not regions:
             _stop_prefetch_ring()
             return
-        ring = CompiledPrefetchRing(device, key, regions)
+        ring = CompiledPrefetchRing(device, key, regions, kv_rows, credits)
         module._prefetch_ring = ring
         PREFETCH_RING_MODULES.add(module)
     if ACTIVE_PREFETCH_RING is not ring:
         ring.configure()
         ACTIVE_PREFETCH_RING = ring
+    if ring.kv_rows is not None:
+        # every layer's cache advances in lockstep, so one cache's row count serves all KV regions
+        ring.refresh(next(c for c in caches if c.prefetch_credit == ck.prefetch_ring.CREDIT_KV).prefetch_regions(seq_len)[0][1])
     if PREFETCH_RING_STATS_EVERY:
         ring.steps += 1
         if ring.steps % PREFETCH_RING_STATS_EVERY == 0:

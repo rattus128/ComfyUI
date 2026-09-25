@@ -53,6 +53,14 @@ class LinearKV(FixedKV):
     def decode_step(self, num_tokens):
         return self.index > 0 and num_tokens <= SPEC_ROWS
 
+    # ring region the deferred decode kernel reads and credits: the fp32 recurrent state
+    prefetch_credit = comfy_kitchen.prefetch_ring.CREDIT_DELTA
+
+    def prefetch_regions(self, seq_len):
+        if self.ctl is None:
+            return []
+        return [(self.recurrent_state.data_ptr(), self.recurrent_state.numel() * self.recurrent_state.element_size())]
+
     def prepare(self, num_tokens):
         # runs every step outside the layer graphs (a replayed forward skips its Python):
         # once per step (the first linear layer) tell this step's kernels what to replay,

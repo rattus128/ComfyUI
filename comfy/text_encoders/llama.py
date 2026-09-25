@@ -96,6 +96,16 @@ class FixedKVBias(FixedKV):
         key = torch.zeros((batch, kv_heads, capacity, head_dim), device=device, dtype=dtype)
         return cls(key, torch.zeros_like(key), 0, *shared)
 
+    # ring regions the flash decode pass reads and credits: the live rows of each (batch, kv head)
+    # K and V. Row counts grow with index, so the ring refreshes them every step.
+    prefetch_credit = comfy_kitchen.prefetch_ring.CREDIT_KV
+
+    def prefetch_regions(self, seq_len):
+        if self.bias is not None:
+            return []
+        row_bytes = (self.index + seq_len) * self.key.shape[-1] * self.key.element_size()
+        return [(t[b, h].data_ptr(), row_bytes) for t in (self.key, self.value) for b in range(t.shape[0]) for h in range(t.shape[1])]
+
     def append(self, xk, xv):
         seq = xk.shape[2]
         self.key[:, :, self.index:self.index + seq] = xk
@@ -1079,7 +1089,7 @@ class Llama2_(nn.Module):
                 intermediate_output = len(self.layers) + intermediate_output
 
         comfy.model_prefetch.prefetch_ring_begin(
-            self.layers, x.device, seq_len, enable_graph and getattr(self, "prefetch_ring_enabled", False),
+            self.layers, x.device, seq_len, enable_graph and getattr(self, "prefetch_ring_enabled", False), past_key_values,
         )
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
