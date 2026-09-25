@@ -26,6 +26,9 @@ MALLOC_GRAPH_USED = False
 PREFETCH_RING_LOOKAHEAD = int(float(os.environ.get("COMFY_PREFETCH_RING_MIB", "8")) * 1024 * 1024)
 # diagnostics: log the issuer's cumulative counters every N steps (synchronizes the device)
 PREFETCH_RING_STATS_EVERY = int(os.environ.get("COMFY_PREFETCH_RING_STATS_EVERY", "0"))
+# diagnostics: with STATS_EVERY, also dump the issuer's lead trace of the last step (see
+# comfy_kitchen.prefetch_ring.set_trace) plus the named region list to this path (torch.save)
+PREFETCH_RING_TRACE = os.environ.get("COMFY_PREFETCH_RING_TRACE")
 PREFETCH_RING_CHUNK = 96 * 1024
 # A/B test scaffold: COMFY_PREFETCH_RING_STATE=kv,delta lists the attention caches whose
 # reading kernels credit the ring (KV rows for flash decode, DeltaNet recurrent state)
@@ -48,6 +51,7 @@ def _prefetch_ring_regions(layers, caches, seq_len):
     that stretch, while an early one would let the issuer skip weights. None while a weight
     is not VBAR-resident."""
     regions = []
+    names = []
     kv_rows = []
     credits = 0
     for i, layer in enumerate(layers):
@@ -58,12 +62,13 @@ def _prefetch_ring_regions(layers, caches, seq_len):
             if cache.prefetch_credit == ck.prefetch_ring.CREDIT_KV:
                 kv_rows.extend(range(len(regions), len(regions) + len(state)))
             regions.extend(state)
-        for s in layer.modules():
+            names.extend(f"{i}.state{j}" for j in range(len(state)))
+        for name, s in layer.named_modules():
             if not isinstance(getattr(s, "weight", None), QuantizedTensor):
                 continue
             weight = getattr(s, "_v_weight", None)
             if weight is None:
-                return None, None, 0
+                return None, None, 0, None
             if weight._layout_cls == "AsymW4A8Int8Layout":
                 if not weight._params.stream_rows or seq_len > 8:
                     continue
@@ -73,15 +78,18 @@ def _prefetch_ring_regions(layers, caches, seq_len):
             else:
                 continue
             regions.append((weight._qdata.data_ptr(), weight._qdata.numel() * weight._qdata.element_size()))
-    return regions, kv_rows, credits
+            names.append(f"{i}.{name}")
+    return regions, kv_rows, credits, names
 
 
 class CompiledPrefetchRing:
-    def __init__(self, device, key, regions, kv_rows, credits):
+    def __init__(self, device, key, regions, kv_rows, credits, names):
         self.device = device
         self.key = key
         self.steps = 0
         self.credits = credits
+        self.names = names
+        self.trace = None
         # KV byte counts grow every step: rewritten in a pinned double buffer and copied over
         # the device list before the issuer starts (start() re-sums the step total)
         self.kv_rows = None
@@ -96,6 +104,17 @@ class CompiledPrefetchRing:
 
     def configure(self):
         ck.configure_prefetch_ring(self.descriptors.view(torch.uint64), len(self.descriptors), PREFETCH_RING_LOOKAHEAD, PREFETCH_RING_CHUNK, self.credits)
+        if PREFETCH_RING_TRACE:
+            if self.trace is None:
+                with pause_malloc_graph(sync=True):
+                    self.trace = torch.zeros(1 << 17, 4, dtype=torch.uint64, device=self.device)
+            ck.prefetch_ring.set_trace(self.trace)
+
+    def dump_trace(self, n):
+        torch.save({"trace": self.trace[:min(n, len(self.trace))].cpu(), "trace_n": n,
+                    "regions": self.descriptors.cpu(), "names": self.names,
+                    "lookahead": PREFETCH_RING_LOOKAHEAD, "chunk": PREFETCH_RING_CHUNK, "steps": self.steps},
+                   PREFETCH_RING_TRACE)
 
     def refresh(self, kv_bytes):
         self.parity ^= 1
@@ -122,12 +141,12 @@ def prefetch_ring_begin(module, device, seq_len, enabled, caches):
         # graph), so the resident weights are where _v_weight says they are.
         regions = None
         if getattr(module, "_prefetch_ring_seen", None) == key:
-            regions, kv_rows, credits = _prefetch_ring_regions(module, caches, seq_len)
+            regions, kv_rows, credits, names = _prefetch_ring_regions(module, caches, seq_len)
         module._prefetch_ring_seen = key
         if not regions:
             _stop_prefetch_ring()
             return
-        ring = CompiledPrefetchRing(device, key, regions, kv_rows, credits)
+        ring = CompiledPrefetchRing(device, key, regions, kv_rows, credits, names)
         module._prefetch_ring = ring
         PREFETCH_RING_MODULES.add(module)
     if ACTIVE_PREFETCH_RING is not ring:
@@ -139,11 +158,13 @@ def prefetch_ring_begin(module, device, seq_len, enabled, caches):
     if PREFETCH_RING_STATS_EVERY:
         ring.steps += 1
         if ring.steps % PREFETCH_RING_STATS_EVERY == 0:
-            total, consumed, stalled, touched, skipped, waited_ns, smids, distinct = ck.prefetch_ring.stats()
+            total, consumed, stalled, touched, skipped, waited_ns, smids, distinct, trace_n = ck.prefetch_ring.stats()
             logging.info(
                 "Comfy prefetch ring after %d steps: touched %.2f GB skipped %.2f GB waited %.1f ms/step stalled %d smids %s distinct-SM hist %s",
                 ring.steps, touched / 1e9, skipped / 1e9, waited_ns / 1e6 / ring.steps, stalled, smids, distinct,
             )
+            if ring.trace is not None:
+                ring.dump_trace(trace_n)
     ck.start_prefetch_ring(device)
 
 def _malloc_graph_break():
