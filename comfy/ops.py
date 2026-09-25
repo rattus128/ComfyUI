@@ -1073,7 +1073,8 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
 
 
 def _streamed_w4a8(linear):
-    weight = linear.weight
+    # the streamed layout is applied to the resident copy (resolve_cast_module_with_vbar)
+    weight = getattr(linear, "_v_weight", linear.weight)
     return (isinstance(weight, QuantizedTensor)
             and weight._layout_cls == "AsymW4A8Int8Layout"
             and weight._params.stream_rows
