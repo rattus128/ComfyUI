@@ -1,5 +1,6 @@
 """YuE2 score/semantic generation and acoustic prefix conditioning."""
 
+import hashlib
 import logging
 
 import torch
@@ -252,6 +253,7 @@ class YuE2TEModel(torch.nn.Module):
             temperature=temperature if do_sample else 0, top_p=top_p, top_k=top_k,
             repetition_penalty=repetition_penalty, penalty_window=tokens.get("penalty_window", 100), min_tokens=min(32, max_length),
         )
+        logging.info("YuE2 abc tokens %d hash %s", len(ids), hashlib.sha256(str(ids).encode()).hexdigest()[:12])
         return ids
 
     def encode_token_weights(self, tokens):
@@ -278,6 +280,7 @@ class YuE2TEModel(torch.nn.Module):
             repetition_penalty=tokens["repetition_penalty"], penalty_window=50,
             min_tokens=min(200, max_tokens),
         )
+        logging.info("YuE2 semantic tokens %d hash %s", len(semantic), hashlib.sha256(str(semantic).encode()).hexdigest()[:12])
         conditioning, chunks = self._acoustic_conditioning(prefix, semantic, dtype)
         return conditioning, None, {
             "yue2_chunks": chunks, "yue2_abc_ids": abc_ids, "yue2_frames": len(semantic),
