@@ -56,7 +56,7 @@ class SwiGLU(nn.Module):
         self.down = operations.Linear(mlpdim, features, bias=bias, device=device, dtype=dtype)
 
     def forward(self, x):
-        return self.down(F.silu(self.gate(x)).mul_(self.up(x)))
+        return self.down(self.gate(x), input_act="swiglu", act_up=self.up(x))
 
 
 class Attention(nn.Module):

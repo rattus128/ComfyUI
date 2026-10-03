@@ -48,6 +48,14 @@ class TimestepProjEmbeddings(nn.Module):
         return self.timestep_embedder(timestep_embedding(timestep.float(), 256).to(dtype))
 
 
+def _modulated_norm(x, scale, eps):
+    if scale is None:
+        return x
+    if comfy.model_management.in_training:
+        return F.layer_norm(x, (x.shape[-1],), eps=eps) * (1 + scale)
+    return comfy.quant_ops.ck.adaln(x, scale, torch.zeros(x.shape[-1], dtype=x.dtype, device=x.device), eps)
+
+
 class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, fused=True, dtype=None, device=None, operations=None):
         super().__init__()
@@ -60,9 +68,12 @@ class SwiGLUFeedForward(nn.Module):
             self.gate_layer = operations.Linear(dim, hidden_dim, bias=False, dtype=dtype, device=device)
         self.out = operations.Linear(hidden_dim, dim, bias=False, dtype=dtype, device=device)
 
-    def forward(self, x):
+    def forward(self, x, scale=None, eps=1e-6):
         if self.fused:
-            return comfy.ops.linear_input_act(self.out, self.gate_up(x), "swiglu")
+            projected = self.gate_up(x, input_act="adaln" if scale is not None else None, act_eps=eps, act_scale=scale)
+            gate, up = projected.chunk(2, dim=-1)
+            return self.out(gate, input_act="swiglu", act_up=up)
+        x = _modulated_norm(x, scale, eps)
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
 
 
@@ -112,16 +123,13 @@ def _split_rows(p):
     return p[-1:].unsqueeze(1), p[:-1].unsqueeze(1)
 
 
-def _modulated_norm(norm, x, scale, prefix_len, zero):
-    # LayerNorm * (1 + scale), fused over every row with the target scale; the prefix rows are then redone with the t = 0 scale
+def _modulation_scale(scale, x, prefix_len):
     s_prefix, s_target = scale
-    if comfy.model_management.in_training:
-        out = norm(x)
-        return torch.cat([out[:, :prefix_len] * (1 + s_prefix), out[:, prefix_len:] * (1 + s_target)], dim=1)
-    out = comfy.quant_ops.ck.adaln(x, s_target, zero, norm.eps)
-    if prefix_len:
-        out[:, :prefix_len] = comfy.quant_ops.ck.adaln(x[:, :prefix_len], s_prefix, zero, norm.eps)
-    return out
+    if prefix_len == 0:
+        return s_target
+    if prefix_len == x.shape[1]:
+        return s_prefix
+    return torch.cat((s_prefix.expand(x.shape[0], prefix_len, -1), s_target.expand(-1, x.shape[1] - prefix_len, -1)), dim=1)
 
 
 def _gated_residual(x, y, gate, prefix_len):
@@ -135,15 +143,15 @@ def _gated_residual(x, y, gate, prefix_len):
 class QwenImage21TransformerBlock(nn.Module):
     def __init__(self, dim, num_attention_heads, attention_head_dim, mlp_ratio=3, eps=1e-6, fused_mlp=True, dtype=None, device=None, operations=None):
         super().__init__()
-        self.img_norm1 = operations.LayerNorm(dim, elementwise_affine=False, eps=eps, dtype=dtype, device=device)
+        self.eps = eps
         self.attn = Attention(dim, num_attention_heads, attention_head_dim, eps=eps, dtype=dtype, device=device, operations=operations)
-        self.img_norm2 = operations.LayerNorm(dim, elementwise_affine=False, eps=eps, dtype=dtype, device=device)
         self.img_mlp = SwiGLUFeedForward(dim, dim * mlp_ratio, fused=fused_mlp, dtype=dtype, device=device, operations=operations)
 
     def forward(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
-        scale1, gate1, scale2, gate2, zero = mod
-        x = _gated_residual(x, self.attn(_modulated_norm(self.img_norm1, x, scale1, prefix_len, zero), pe, attn_fn, prefix_len, transformer_options), gate1, prefix_len)
-        x = _gated_residual(x, self.img_mlp(_modulated_norm(self.img_norm2, x, scale2, prefix_len, zero)), gate2, prefix_len)
+        scale1, gate1, scale2, gate2 = mod
+        x = _gated_residual(x, self.attn(_modulated_norm(x, _modulation_scale(scale1, x, prefix_len), self.eps),
+                                        pe, attn_fn, prefix_len, transformer_options), gate1, prefix_len)
+        x = _gated_residual(x, self.img_mlp(x, _modulation_scale(scale2, x, prefix_len), self.eps), gate2, prefix_len)
         if x.dtype == torch.float16:
             x.clamp_(-65504, 65504)
         return x
@@ -351,7 +359,7 @@ class QwenImage21Transformer2DModel(nn.Module):
         t = ((timesteps * 1000).to(dtype) / 1000).to(dtype)
         temb = self.time_text_embed(torch.cat([t, t.new_zeros(1)]), dtype)
         scale1, gate1, scale2, gate2 = self.modulation(temb).chunk(4, dim=-1)
-        mod = (_split_rows(scale1), _split_rows(gate1.tanh()), _split_rows(scale2), _split_rows(gate2.tanh()), torch.zeros_like(scale1[:1, None]))
+        mod = (_split_rows(scale1), _split_rows(gate1.tanh()), _split_rows(scale2), _split_rows(gate2.tanh()))
 
         blocks_replace = transformer_options.get("patches_replace", {}).get("dit", {})
         cache, cached = None, False

@@ -73,6 +73,24 @@ def clamp_fp16(x):
         return torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
     return x
 
+
+def _norm_linear(linear, x, norm, scale=None, timestep_zero_index=None):
+    if timestep_zero_index is not None:
+        x = norm(x)
+        if scale is not None:
+            x = modulate(x, scale, timestep_zero_index)
+        return linear(x)
+    return linear(x, input_act=norm, act_scale=None if scale is None else scale.unsqueeze(1))
+
+
+def _norm_residual(x, norm, residual, gate, timestep_zero_index=None):
+    if comfy.model_management.in_training or timestep_zero_index is not None:
+        return residual + apply_gate(gate, norm(x), timestep_zero_index)
+    with comfy.ops.CastBiasWeightContext(norm, x, offloadable=True) as (weight, _):
+        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        return comfy.quant_ops.ck.rms_gated_residual(x, weight, residual, gate, eps)
+
+
 class JointAttention(nn.Module):
     """Multi-head attention module."""
 
@@ -130,6 +148,9 @@ class JointAttention(nn.Module):
         x_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
         transformer_options={},
+        norm=None,
+        scale=None,
+        timestep_zero_index=None,
     ) -> torch.Tensor:
         """
 
@@ -144,7 +165,7 @@ class JointAttention(nn.Module):
         bsz, seqlen, _ = x.shape
 
         xq, xk, xv = torch.split(
-            self.qkv(x),
+            _norm_linear(self.qkv, x, norm, scale, timestep_zero_index),
             [
                 self.n_local_heads * self.head_dim,
                 self.n_local_kv_heads * self.head_dim,
@@ -233,12 +254,12 @@ class FeedForward(nn.Module):
             dtype=operation_settings.get("dtype"),
         )
 
-    # @torch.compile
-    def _forward_silu_gating(self, x1, x3):
-        return clamp_fp16(F.silu(x1) * x3)
-
-    def forward(self, x):
-        return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+    def forward(self, x, norm=None, scale=None, timestep_zero_index=None):
+        gate = _norm_linear(self.w1, x, norm, scale, timestep_zero_index)
+        up = _norm_linear(self.w3, x, norm, scale, timestep_zero_index)
+        if gate.dtype == torch.float16:
+            return self.w2(clamp_fp16(F.silu(gate) * up))
+        return self.w2(gate, input_act="swiglu", act_up=up)
 
 
 class JointTransformerBlock(nn.Module):
@@ -339,32 +360,31 @@ class JointTransformerBlock(nn.Module):
             assert adaln_input is not None
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).chunk(4, dim=1)
 
-            x = x + apply_gate(gate_msa.unsqueeze(1).tanh(), self.attention_norm2(
-                clamp_fp16(self.attention(
-                    modulate(self.attention_norm1(x), scale_msa, timestep_zero_index=timestep_zero_index),
-                    x_mask,
-                    freqs_cis,
-                    transformer_options=transformer_options,
-                ))), timestep_zero_index=timestep_zero_index
-            )
-            x = x + apply_gate(gate_mlp.unsqueeze(1).tanh(), self.ffn_norm2(
-                clamp_fp16(self.feed_forward(
-                    modulate(self.ffn_norm1(x), scale_mlp, timestep_zero_index=timestep_zero_index),
-                ))), timestep_zero_index=timestep_zero_index
-            )
+            attn_out = clamp_fp16(self.attention(
+                x, x_mask, freqs_cis, transformer_options=transformer_options,
+                norm=self.attention_norm1, scale=scale_msa,
+                timestep_zero_index=timestep_zero_index))
+            x = _norm_residual(attn_out, self.attention_norm2, x,
+                               gate_msa.unsqueeze(1).tanh(), timestep_zero_index)
+            ffn_out = clamp_fp16(self.feed_forward(
+                x, norm=self.ffn_norm1, scale=scale_mlp,
+                timestep_zero_index=timestep_zero_index))
+            x = _norm_residual(ffn_out, self.ffn_norm2, x,
+                               gate_mlp.unsqueeze(1).tanh(), timestep_zero_index)
         else:
             assert adaln_input is None
             x = x + self.attention_norm2(
                 clamp_fp16(self.attention(
-                    self.attention_norm1(x),
+                    x,
                     x_mask,
                     freqs_cis,
                     transformer_options=transformer_options,
+                    norm=self.attention_norm1,
                 ))
             )
             x = x + self.ffn_norm2(
                 self.feed_forward(
-                    self.ffn_norm1(x),
+                    x, norm=self.ffn_norm1,
                 )
             )
         return x

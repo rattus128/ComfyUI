@@ -487,6 +487,18 @@ class CastWeightBiasOp:
     weight_function = []
     bias_function = []
 
+
+class LinearInputAct:
+    def forward(self, input, input_act=None, act_weight=None, act_eps=0.0,
+                residual=None, residual_scale=None, act_scale=None, act_shift=None,
+                act_up=None):
+        if input_act is None and residual is None and act_up is None:
+            run_every_op()
+            return self._forward_linear(input)
+        return linear_input_act(self, input, input_act, act_weight, act_eps,
+                                residual, residual_scale, act_scale, act_shift, act_up)
+
+
 class disable_weight_init:
     @staticmethod
     def _zero_init_parameter(module, name):
@@ -521,7 +533,7 @@ class disable_weight_init:
             module.bias = torch.nn.Parameter(torch.zeros(bias_shape), requires_grad=False)
             missing_keys.append(prefix + "bias")
 
-    class Linear(torch.nn.Linear, CastWeightBiasOp):
+    class Linear(LinearInputAct, torch.nn.Linear, CastWeightBiasOp):
 
         def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
             # don't trust subclasses that BYO state dict loader to call us.
@@ -570,12 +582,11 @@ class disable_weight_init:
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                 return torch.nn.functional.linear(input, weight, bias)
 
-        def forward(self, *args, **kwargs):
-            run_every_op()
+        def _forward_linear(self, *args, **kwargs):
             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
-                return super().forward(*args, **kwargs)
+                return torch.nn.Linear.forward(self, *args, **kwargs)
 
     class Conv1d(torch.nn.Conv1d, CastWeightBiasOp):
         def reset_parameters(self):
@@ -685,8 +696,11 @@ class disable_weight_init:
             self.bias = None
             return None
 
+        def cast_weight(self, input):
+            return CastBiasWeightContext(self if self.weight is not None else None, input, offloadable=True)
+
         def forward_comfy_cast_weights(self, input):
-            with CastBiasWeightContext(self if self.weight is not None else None, input, offloadable=True) as (weight, bias):
+            with self.cast_weight(input) as (weight, bias):
                 return torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
 
         def forward(self, *args, **kwargs):
@@ -921,6 +935,8 @@ except ImportError:
 if CUBLAS_IS_AVAILABLE:
     class cublas_ops(manual_cast):
         class Linear(CublasLinear, manual_cast.Linear):
+            forward = LinearInputAct.forward
+
             def reset_parameters(self):
                 return None
 
@@ -928,8 +944,7 @@ if CUBLAS_IS_AVAILABLE:
                 with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                     return cublas_half_matmul(input, weight, bias, self._epilogue_str, self.has_bias)
 
-            def forward(self, *args, **kwargs):
-                run_every_op()
+            def _forward_linear(self, *args, **kwargs):
                 if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
                     return self.forward_comfy_cast_weights(*args, **kwargs)
                 else:
@@ -958,12 +973,26 @@ INPUT_ACT_EAGER = {
 }
 
 
-def _eager_input_act(x, input_act, act_weight=None, act_eps=0.0):
+def _eager_input_act(x, input_act, act_weight=None, act_eps=0.0, act_scale=None, act_shift=None, act_up=None):
+    if (act_scale is not None or act_shift is not None) and input_act not in ("rms_norm", "adaln"):
+        raise ValueError("input modulation requires input_act 'rms_norm' or 'adaln'")
     if input_act is None:
         return x
-    if input_act == "rms_norm":
-        return comfy.rmsnorm.rms_norm(x, act_weight, act_eps)
-    return INPUT_ACT_EAGER[input_act](x)
+    if input_act == "swiglu" and act_up is not None:
+        activated = torch.nn.functional.silu(x).mul_(act_up)
+    elif input_act == "rms_norm":
+        activated = comfy.rmsnorm.rms_norm(x.float(), act_weight, act_eps).to(x.dtype)
+    elif input_act == "adaln" and comfy.model_management.in_training:
+        activated = torch.nn.functional.layer_norm(x, (x.shape[-1],), eps=act_eps)
+    elif input_act == "adaln":
+        zero = torch.zeros(x.shape[-1], dtype=x.dtype, device=x.device)
+        return quant_ops.ck.adaln(x, zero if act_scale is None else act_scale,
+                                  zero if act_shift is None else act_shift, act_eps)
+    else:
+        activated = INPUT_ACT_EAGER[input_act](x)
+    if act_scale is not None:
+        activated = activated * (1 + act_scale)
+    return activated if act_shift is None else activated + act_shift
 
 
 def _fp16_linear_wanted(x):
@@ -974,7 +1003,8 @@ def _fp16_linear_wanted(x):
 
 
 def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
-                     residual=None, residual_scale=None):
+                     residual=None, residual_scale=None, act_scale=None, act_shift=None,
+                     act_up=None):
     """``linear(act(x))``, with ``act`` folded into an INT8 activation quantizer.
 
     An INT8 linear quantizes its input anyway, so an elementwise activation can
@@ -982,13 +1012,48 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
     HBM and reading it straight back. Worth it for an MLP's down-projection,
     where the intermediate is several times the hidden size, and for a pre-norm
     block's ``linear(rms_norm(x))`` ("rms_norm", which reads the norm's weight
-    and eps from act_weight/act_eps).
+    and eps from act_weight/act_eps), or AdaLN ("adaln"). RMSNorm promotes input
+    and weight independently to FP32.
+    Optional act_scale modulates the norm by ``(1 + act_scale)`` before the
+    linear, followed by optional act_shift. Both use normal broadcasting and
+    shift does not require scale. The fused RMSNorm/modulation keeps FP32
+    intermediates, as does the fused SwiGLU; eager fallbacks retain their
+    tensor-storage rounding and need not be bit-identical.
+
+    For SwiGLU, act_up supplies a separate up operand matching x (the gate) in
+    shape, dtype and device. Without it, x retains the packed [gate | up] form.
+    Both operands may be views of one projection; no concatenation is needed.
 
     With ``residual``/``residual_scale`` the result is the pre-norm block's
     addcmul, ``residual + residual_scale * linear(act(x))``, fused into the
     INT8 GEMM epilogue where supported.
 
+    input_act may also be an RMSNorm layer exposing cast_weight(x) and eps.
+    Its context keeps the norm weight resident through the linear. None skips
+    the prologue, including its modulation.
     """
+    run_every_op()
+    if act_up is not None:
+        if input_act != "swiglu":
+            raise ValueError("act_up requires input_act='swiglu'")
+        if act_up.shape != x.shape or act_up.dtype != x.dtype or act_up.device != x.device:
+            raise ValueError("act_up must match x's shape, dtype and device")
+    if isinstance(input_act, torch.nn.Module):
+        norm = input_act
+        if comfy.model_management.in_training:
+            x = norm(x)
+            if act_scale is not None:
+                x = x * (1 + act_scale)
+            if act_shift is not None:
+                x = x + act_shift
+            return linear_input_act(linear, x, None, residual=residual, residual_scale=residual_scale)
+        with norm.cast_weight(x) as (weight, _):
+            eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+            return linear_input_act(linear, x, "rms_norm", weight, eps,
+                                    residual, residual_scale, act_scale, act_shift, act_up)
+    if input_act is None:
+        act_scale = act_shift = None
+
     def _residual_out(out):
         if residual is None:
             return out
@@ -1008,11 +1073,12 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
             weight, bias, offload_stream = cast_bias_weight(linear, x, offloadable=True)
             try:
                 return quant_ops.ck.fp16_linear(
-                    _eager_input_act(x, input_act, act_weight, act_eps),
+                    _eager_input_act(x, input_act, act_weight, act_eps, act_scale, act_shift, act_up),
                     weight, bias, residual=residual, residual_scale=residual_scale)
             finally:
                 uncast_bias_weight(linear, weight, bias, offload_stream)
-        return _residual_out(linear(_eager_input_act(x, input_act, act_weight, act_eps)))
+        forward = linear._forward_linear if isinstance(linear, LinearInputAct) else linear
+        return _residual_out(forward(_eager_input_act(x, input_act, act_weight, act_eps, act_scale, act_shift, act_up)))
 
     # want_requant keeps a vbar-streamed layer on the INT8 path when a LoRA is
     # patched in on the fly; without it the cast hands back a dequantized weight.
@@ -1023,7 +1089,7 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
             # A LoRA weight_function, or activations whose dtype differs from the
             # weight's, make the cast hand back a dequantized tensor.
             return _residual_out(torch.nn.functional.linear(
-                _eager_input_act(x, input_act, act_weight, act_eps), weight, bias))
+                _eager_input_act(x, input_act, act_weight, act_eps, act_scale, act_shift, act_up), weight, bias))
         qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
         return quant_ops.ck.int8_linear(
             x, qdata, scale, bias, x.dtype,
@@ -1034,6 +1100,9 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
             input_act_eps=act_eps,
             residual=residual,
             residual_scale=residual_scale,
+            input_act_scale=act_scale,
+            input_act_shift=act_shift,
+            input_act_up=act_up,
         )
     finally:
         uncast_bias_weight(linear, weight, bias, offload_stream)
@@ -1364,7 +1433,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
         _full_precision_mm = full_precision_mm
         _disabled = disabled
 
-        class Linear(torch.nn.Module, MixedPrecisionOp):
+        class Linear(LinearInputAct, torch.nn.Module, MixedPrecisionOp):
             _disabled_formats = disabled
 
             def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
@@ -1429,9 +1498,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     weight = weight.to(dtype=input.dtype)
                     return self._forward(input, weight, bias)
 
-            def forward(self, input, *args, **kwargs):
-                run_every_op()
-
+            def _forward_linear(self, input):
                 # ModelOpt AWQ-style smoothing
                 pre_quant_scale = getattr(self, 'pre_quant_scale', None)
                 if pre_quant_scale is not None:
