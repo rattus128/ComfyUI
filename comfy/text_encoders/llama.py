@@ -28,6 +28,8 @@ class FixedKV:
     index: int
     position: torch.Tensor
     seqlen: torch.Tensor
+    # [B, capacity, kv heads, D] interleaves the heads its decode kernel reads: not ring-listed
+    prefetch_credit = None
 
     def prepare(self, num_tokens):
         self.position.copy_(self.seqlen)
@@ -72,6 +74,15 @@ class FixedKVState(FixedKV):
 
 class FixedKVCache(FixedKVState):
     # [B, kv heads, capacity, D] storage with shared decode position state.
+    # the GQA decode kernel credits the prefetch ring for the live rows of each (batch, kv head)
+    prefetch_credit = "kv"
+
+    def prefetch_regions(self, seq_len):
+        tree = self.tracker["tree"]
+        rows = self.index if tree is not None and seq_len == tree.rows else self.index + seq_len
+        row_bytes = rows * self.key.shape[-1] * self.key.element_size()
+        return [(t[b, h].data_ptr(), row_bytes) for t in (self.key, self.value) for b in range(t.shape[0]) for h in range(t.shape[1])]
+
     @classmethod
     def zeros(cls, batch, kv_heads, capacity, head_dim, device, dtype, shared):
         # zero-init: decode attends full capacity with masked tails, 0*0 stays finite
@@ -1048,6 +1059,8 @@ class Llama2_(nn.Module):
             elif intermediate_output < 0:
                 intermediate_output = len(self.layers) + intermediate_output
 
+        if enable_graph:
+            comfy.model_prefetch.prefetch_ring_begin(self.layers, x.device, seq_len, past_key_values)
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
         for i, layer in enumerate(self.layers):

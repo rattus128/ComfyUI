@@ -51,6 +51,14 @@ class LinearKV(FixedKV):
     def decode_step(self, num_tokens):
         return self.index > 0 and num_tokens <= SPEC_ROWS
 
+    # the deferred decode kernel credits the prefetch ring for the fp32 recurrent state
+    prefetch_credit = "delta"
+
+    def prefetch_regions(self, seq_len):
+        if self.ctl is None:
+            return []
+        return [(self.recurrent_state.data_ptr(), self.recurrent_state.numel() * self.recurrent_state.element_size())]
+
     def prepare(self, num_tokens):
         # runs eagerly before the layer (a replayed graph skips its Python): the first linear
         # layer of a step hands the kernels what to commit, every layer records what it leaves
@@ -487,6 +495,10 @@ class GatedAttention(nn.Module):
             shared[cache_type] = cache_type.shared(batch, device)
         return cache_type.zeros(batch, self.num_kv_heads, capacity, self.head_dim, device, dtype, shared[cache_type])
 
+    def kernel_attend(self, cache):
+        # the cache's decode kernel attends it; otherwise configured attention reads it through mask()
+        return isinstance(cache, Int8FixedKVCache) or self.comfy_attention.method is None and not comfy.model_management.comfy_kitchen_attention_enabled()
+
     def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
         batch_size, seq_length, _ = x.shape
 
@@ -513,8 +525,7 @@ class GatedAttention(nn.Module):
         if decode:
             past_key_value.write(xk, xv)
 
-        if decode and (isinstance(past_key_value, Int8FixedKVCache) or
-                       self.comfy_attention.method is None and not comfy.model_management.comfy_kitchen_attention_enabled()):
+        if decode and self.kernel_attend(past_key_value):
             output = past_key_value.attend(xq, xk, xv)
         else:
             if decode:
@@ -557,6 +568,23 @@ class Qwen35TransformerBlock(nn.Module):
         x = torch.add(x, h, out=output)
         x = torch.add(x, self.mlp(x, norm=self.post_attention_layernorm), out=output)
         return x, present_key_value
+
+    def prefetch_reads(self, kv):
+        # what a decode step reads, in order, for the prefetch ring (the attention state ahead of the
+        # weights); norm scales are per-call temporaries and kv-owned tensors are None until prefill
+        reads = [kv]
+        if self.layer_type == "linear_attention":
+            a = self.linear_attn
+            reads += [a.in_proj_qkv, a.in_proj_z, a.conv1d, kv.conv_state, a.in_proj_a, a.in_proj_b, kv.dt_bias, kv.g_decay, kv.norm_weight, a.out_proj]
+        else:
+            a = self.self_attn
+            if not a.kernel_attend(kv):
+                reads[0] = None  # configured attention does not credit the ring
+            reads += [a.q_proj, a.k_proj, a.v_proj, a.o_proj]
+        m = self.mlp
+        reads += [m.gate_up_proj] if m.merged_mlp else [m.gate_proj, m.up_proj]
+        reads.append(m.down_proj)
+        return reads
 
 
 # Qwen35 Transformer Backbone

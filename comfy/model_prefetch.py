@@ -12,6 +12,7 @@ from comfy.cli_args import args
 import comfy.memory_management
 import comfy.model_management
 import comfy.ops
+from comfy.quant_ops import QuantizedTensor
 
 PREFETCH_QUEUES = []
 GRAPH_WARMED_MODULES = weakref.WeakSet()
@@ -20,6 +21,161 @@ MALLOC_GRAPHS = {}
 MALLOC_GRAPH_BREAKS = 0
 MALLOC_GRAPH_ROGUES = 0
 MALLOC_GRAPH_USED = False
+# Prefetch ring (lookahead MiB, min lead MiB) by device L2 MiB, measured on the RTX 5090 and RTX 5080.
+# Overshooting the L2 evicts prefetched weights before their GEMV reads them; the ring stays off on
+# unmeasured parts (the 24 MiB RTX 5060 lost 12% at half its L2). min_lead is the in-flight depth:
+# a chunk requested closer than that to the consumed position lands after its reader dropped it.
+PREFETCH_RING_LOOKAHEAD_MIB = {96: (60, 16), 64: (55, 8)}
+PREFETCH_RING_CHUNK = 96 * 1024
+# Bumped whenever a graphed layer runs outside graph replay or an execution ends: the resident
+# weight addresses a ring was built from may have moved.
+PREFETCH_RING_GENERATION = 0
+ACTIVE_PREFETCH_RING = None
+PREFETCH_RING_MODULES = weakref.WeakSet()
+
+
+def _prefetch_ring_credit(cache):
+    # attention caches whose reading kernels credit the ring: flash decode K/V rows, DeltaNet state
+    return {"kv": ck.prefetch_ring.CREDIT_KV, "delta": ck.prefetch_ring.CREDIT_DELTA}.get(cache.prefetch_credit, 0)
+
+
+def _prefetch_ring_regions(layers, caches, seq_len):
+    """(address, bytes, flags) of everything the step's decode kernels read, in read order, the
+    KV region indices and the credit mask. A layer lists its reads through prefetch_reads(cache)
+    (its cache, ops modules and stable plain tensors), otherwise its quantized weights in module
+    order. A layer's attention state is listed ahead of its weights: a late credit only narrows
+    the window, an early one would let the issuer skip weights. Reads no decode kernel credits
+    are flagged for the issuer to credit itself. None while a weight is not VBAR-resident."""
+    regions = []
+    kv_rows = []
+    credits = 0
+
+    def add(address, size, flags=0):
+        if address % 16 == 0 and size % 16 == 0:  # bulk prefetch granularity
+            regions.append((address, size, flags))
+
+    def add_tensor(tensor):
+        add(tensor.data_ptr(), tensor.numel() * tensor.element_size(), ck.prefetch_ring.SELF_CREDIT)
+
+    def add_module(s):
+        weight = getattr(s, "_v_weight", None)
+        if weight is None:
+            return not isinstance(s.weight, QuantizedTensor)
+        if isinstance(weight, QuantizedTensor):
+            # only the streamed W4A8 decode and the int8 GEMV credit the ring
+            if weight._layout_cls == "AsymW4A8Int8Layout":
+                if not weight._params.mma_packed or seq_len > 8:
+                    return True
+            elif weight._layout_cls != "TensorWiseINT8Layout" or seq_len > 2 or weight.shape[1] % 16:
+                return True
+            add(weight._qdata.data_ptr(), weight._qdata.numel() * weight._qdata.element_size())
+        else:
+            add_tensor(weight)
+        if s._v_bias is not None:
+            add_tensor(s._v_bias)
+        return True
+
+    def add_cache(cache):
+        nonlocal credits
+        credit = _prefetch_ring_credit(cache)
+        state = cache.prefetch_regions(seq_len) if credit else []
+        if state:
+            credits |= credit
+        if credit == ck.prefetch_ring.CREDIT_KV:
+            kv_rows.extend(range(len(regions), len(regions) + len(state)))
+        regions.extend((address, size, 0) for address, size in state)
+
+    for layer, cache in zip(layers, caches):
+        if hasattr(layer, "prefetch_reads"):
+            reads = layer.prefetch_reads(cache)
+        else:
+            reads = [cache] + [s for s in layer.modules() if isinstance(getattr(s, "weight", None), QuantizedTensor)]
+        for read in reads:
+            if read is None:
+                continue
+            if isinstance(read, torch.Tensor):
+                add_tensor(read)
+            elif hasattr(read, "prefetch_credit"):
+                add_cache(read)
+            elif not add_module(read):
+                return None, None, 0
+    return regions, kv_rows, credits
+
+
+class CompiledPrefetchRing:
+    def __init__(self, device, key, regions, kv_rows, credits):
+        self.device = device
+        self.key = key
+        self.credits = credits
+        # KV byte counts grow every step: rewritten in a pinned double buffer and copied over the
+        # device list before the issuer starts (start() re-sums the step total)
+        self.kv_rows = None
+        with pause_malloc_graph(sync=True):
+            self.descriptors = torch.tensor(regions, dtype=torch.int64, device=device)
+            if kv_rows:
+                self.kv_rows = torch.tensor(kv_rows, dtype=torch.int64)
+                self.host = torch.tensor([regions, regions], dtype=torch.int64).pin_memory()
+                self.copied = [torch.cuda.Event(), torch.cuda.Event()]
+                self.parity = 0
+        self.lookahead, self.min_lead = prefetch_ring_lookahead(device)
+        logging.info("Comfy prefetch ring: %d regions (%.2f GiB), lookahead %d MiB", len(regions),
+                     sum(size for _, size, _ in regions) / (1024 ** 3), self.lookahead >> 20)
+
+    def configure(self):
+        ck.configure_prefetch_ring(self.descriptors.view(torch.uint64), len(self.descriptors), self.lookahead, self.min_lead, PREFETCH_RING_CHUNK, self.credits)
+
+    def refresh(self, kv_bytes):
+        self.parity ^= 1
+        # the pinned row is reused every other step: its previous copy must have landed
+        self.copied[self.parity].synchronize()
+        host = self.host[self.parity]
+        host[:, 1].index_fill_(0, self.kv_rows, kv_bytes)
+        self.descriptors.copy_(host, non_blocking=True)
+        self.copied[self.parity].record(torch.cuda.current_stream(self.device))
+
+
+def _stop_prefetch_ring():
+    global ACTIVE_PREFETCH_RING
+    if ACTIVE_PREFETCH_RING is not None:
+        ck.disable_prefetch_ring(ACTIVE_PREFETCH_RING.device)
+        ACTIVE_PREFETCH_RING = None
+
+
+def prefetch_ring_lookahead(device):
+    lookahead, min_lead = PREFETCH_RING_LOOKAHEAD_MIB.get(torch.cuda.get_device_properties(device).L2_cache_size >> 20, (0, 0))
+    return lookahead << 20, min_lead << 20
+
+
+def prefetch_ring_begin(layers, device, seq_len, caches):
+    """Start the L2 prefetch ring over one graphed decode step of `layers`."""
+    global ACTIVE_PREFETCH_RING
+    malloc_graph = MALLOC_GRAPHS.get(threading.get_ident())
+    # eager layers do not bump the generation: their weights may move under a built ring
+    if malloc_graph is None or not malloc_graph._comfy_active or args.disable_cuda_graphs or not ck.prefetch_ring_is_available():
+        _stop_prefetch_ring()
+        return
+    key = (PREFETCH_RING_GENERATION, seq_len)
+    ring = getattr(layers, "_prefetch_ring", None)
+    if ring is None or ring.key != key:
+        # build only after a full step at this generation (every layer replayed its graph), so
+        # the resident weights are where _v_weight says they are
+        regions = None
+        if getattr(layers, "_prefetch_ring_seen", None) == key and prefetch_ring_lookahead(device)[0] > 0:
+            regions, kv_rows, credits = _prefetch_ring_regions(layers, caches, seq_len)
+        layers._prefetch_ring_seen = key
+        if not regions:
+            _stop_prefetch_ring()
+            return
+        ring = CompiledPrefetchRing(device, key, regions, kv_rows, credits)
+        layers._prefetch_ring = ring
+        PREFETCH_RING_MODULES.add(layers)
+    if ACTIVE_PREFETCH_RING is not ring:
+        ring.configure()
+        ACTIVE_PREFETCH_RING = ring
+    if ring.kv_rows is not None:
+        # every layer's cache advances in lockstep, so one cache's row count serves all KV regions
+        ring.refresh(next(c for c in caches if c.prefetch_credit == "kv").prefetch_regions(seq_len)[0][1])
+    ck.start_prefetch_ring(device)
 
 def _malloc_graph_break():
     global MALLOC_GRAPH_BREAKS
@@ -155,13 +311,21 @@ def cleanup_prefetch_queues():
     global MALLOC_GRAPH_BREAKS
     global MALLOC_GRAPH_ROGUES
     global MALLOC_GRAPH_USED
+    global PREFETCH_RING_GENERATION
 
+    _stop_prefetch_ring()
+    PREFETCH_RING_GENERATION += 1
+    if PREFETCH_RING_MODULES:
+        comfy.model_management.synchronize()
     cleanup_malloc_graph()
     for queue in PREFETCH_QUEUES:
         # Only the head has been prefetched; later entries are raw module groups.
         if queue[0] is not None:
             _, (prefetched_module, comfy_modules) = queue[0]
             cleanup_prefetched_modules(prefetched_module, comfy_modules)
+    for module in PREFETCH_RING_MODULES:
+        del module._prefetch_ring
+    PREFETCH_RING_MODULES.clear()
     PREFETCH_QUEUES = []
     GRAPH_WARMED_MODULES.clear()
     if MALLOC_GRAPH_USED:
@@ -171,6 +335,7 @@ def cleanup_prefetch_queues():
     MALLOC_GRAPH_USED = False
 
 def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_graph=False, generator=None, malloc_scope=None):
+    global PREFETCH_RING_GENERATION
     malloc_graph = MALLOC_GRAPHS.get(threading.get_ident())
     if malloc_graph is not None and not malloc_graph._comfy_active:
         malloc_graph = None
@@ -223,6 +388,11 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
         queue[0] = (None, (module, []))
         graph["graph"].replay()
         return
+    if enable_graph and module is not None:
+        # outside replay the layer's weights may land at new addresses, and a capture's device
+        # sync would deadlock against a polling ring issuer
+        PREFETCH_RING_GENERATION += 1
+        _stop_prefetch_ring()
 
     fully_faulted = False
     prefetch = queue[0]
