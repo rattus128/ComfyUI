@@ -753,6 +753,7 @@ class MLP(nn.Module):
         self.merged_mlp = getattr(config, "merged_mlp", False)
         if self.merged_mlp:
             self.gate_up_proj = ops.Linear(config.hidden_size, intermediate_size * 2, bias=False, device=device, dtype=dtype)
+            self.gate_up_proj.comfy_merged_from = (("gate_proj", intermediate_size), ("up_proj", intermediate_size))
         else:
             self.gate_proj = ops.Linear(config.hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
             self.up_proj = ops.Linear(config.hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)

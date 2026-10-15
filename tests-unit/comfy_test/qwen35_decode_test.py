@@ -237,7 +237,7 @@ def test_deferred_ctl_rows_wait_for_their_previous_copy(monkeypatch):
     assert step(1) == [3, 0]
 
 
-def _tiny_model(monkeypatch, layers=4, head_dim=64):
+def _tiny_model(monkeypatch, layers=4, head_dim=64, **overrides):
     import comfy.text_encoders.qwen35 as qwen35
     monkeypatch.setitem(qwen35.QWEN35_MODELS, "tiny", dict(vision=dict(hidden_size=32, num_heads=2, intermediate_size=64, depth=1)))
 
@@ -245,7 +245,7 @@ def _tiny_model(monkeypatch, layers=4, head_dim=64):
         model_type = "tiny"
     config = dict(vocab_size=97, hidden_size=64, intermediate_size=128, num_hidden_layers=layers, layer_types=qwen35._qwen35_layer_types(layers),
                   num_attention_heads=2, num_key_value_heads=1, head_dim=head_dim, linear_num_key_heads=2, linear_num_value_heads=2,
-                  linear_key_head_dim=16, linear_value_head_dim=16, mtp=True, lm_head=True, stop_tokens=[])
+                  linear_key_head_dim=16, linear_value_head_dim=16, mtp=True, lm_head=True, stop_tokens=[], **overrides)
     torch.manual_seed(0)
     model = Tiny(config, torch.float32, "cpu", comfy.ops.manual_cast)
     model.requires_grad_(False)
@@ -443,3 +443,86 @@ def test_configured_decode_preserves_causal_visibility(monkeypatch, seq):
     default, _ = attn(x, attention_mask=mask, freqs_cis=freqs, optimized_attention=attention.attention_pytorch)
     assert default.abs().max() > 0
     torch.testing.assert_close(configured, default * 0.25)
+
+
+def _split_sd(prefix, quant=b'{"format": "w6a8_int8"}'):
+    sd = {}
+    for name, rows in (("self_attn.q_proj", 8), ("self_attn.k_proj", 2), ("self_attn.v_proj", 2), ("mlp.gate_proj", 6), ("mlp.up_proj", 6)):
+        sd["{}{}.weight".format(prefix, name)] = torch.randint(-128, 127, (rows, 3), dtype=torch.int8)
+        sd["{}{}.weight_s_rel".format(prefix, name)] = torch.randn(rows, 1).to(torch.float8_e4m3fn)
+        sd["{}{}.weight_s_channel".format(prefix, name)] = torch.randn(rows)
+        sd["{}{}.weight_codebook".format(prefix, name)] = torch.arange(16, dtype=torch.float32)
+        sd["{}{}.comfy_quant".format(prefix, name)] = torch.tensor(list(quant), dtype=torch.uint8)
+    return sd
+
+
+def test_merge_projections_concatenates_rows_and_keeps_shared_metadata():
+    from comfy.text_encoders.qwen35 import merge_projections
+    sd = {**_split_sd("model.layers.3."), **_split_sd("mtp.layers.0.")}
+    ref = dict(sd)
+    assert merge_projections(sd) == {"merged_qkv": True, "merged_mlp": True}
+    for prefix in ("model.layers.3.", "mtp.layers.0."):
+        for name in ("weight", "weight_s_rel", "weight_s_channel"):
+            merged = sd["{}self_attn.qkv_proj.{}".format(prefix, name)]
+            expected = torch.cat([ref["{}self_attn.{}_proj.{}".format(prefix, n, name)] for n in "qkv"])
+            assert merged.dtype == expected.dtype and torch.equal(merged.view(torch.uint8), expected.view(torch.uint8))
+        assert sd[prefix + "mlp.gate_up_proj.comfy_quant"] is ref[prefix + "mlp.gate_proj.comfy_quant"]
+        assert sd[prefix + "mlp.gate_up_proj.weight_codebook"] is ref[prefix + "mlp.gate_proj.weight_codebook"]
+    assert not any(".q_proj." in k or ".gate_proj." in k or ".up_proj." in k for k in sd)
+    assert merge_projections(sd) == {"merged_qkv": True, "merged_mlp": True}  # an already merged checkpoint
+
+
+@pytest.mark.parametrize("member,name,value", [
+    ("self_attn.k_proj", "comfy_quant", torch.tensor(list(b'{"format": "w6a8_int8", "group_size": 32}'), dtype=torch.uint8)),
+    ("self_attn.k_proj", "weight_codebook", torch.arange(16, dtype=torch.float32) * 2),
+    ("self_attn.k_proj", "weight_s_channel", torch.randn(2, dtype=torch.float16)),
+    ("self_attn.v_proj", "input_scale", torch.ones(())),
+])
+def test_merge_projections_keeps_split_on_metadata_mismatch(member, name, value):
+    from comfy.text_encoders.qwen35 import merge_projections
+    sd = {**_split_sd("model.layers.3."), **_split_sd("mtp.layers.0.")}
+    sd["mtp.layers.0.{}.{}".format(member, name)] = value
+    ref = dict(sd)
+    assert merge_projections(sd) == {"merged_qkv": False, "merged_mlp": True}
+    assert all(sd[k] is v for k, v in ref.items() if ".self_attn." in k)
+    assert not any(".qkv_proj." in k for k in sd)
+
+
+def _patched_weights(model, lora):
+    import comfy.lora
+    from comfy.model_patcher import ModelPatcher
+    patcher = ModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
+    patcher.add_patches(comfy.lora.load_lora(lora, comfy.lora.model_lora_keys_clip(model, {})))
+    patcher.patch_model()
+    weights = {k: v.clone() for k, v in model.state_dict().items()}
+    patcher.unpatch_model()
+    return weights
+
+
+def test_merged_projections_match_split_model_and_lora(monkeypatch):
+    from comfy.text_encoders.qwen35 import merge_projections
+    from comfy.text_encoders.qwen_vl import qwen2vl_mrope_position_ids
+    split = _tiny_model(monkeypatch)
+    sd = split.state_dict()
+    flags = merge_projections(sd)
+    assert flags == {"merged_qkv": True, "merged_mlp": True}
+    merged = _tiny_model(monkeypatch, **flags)
+    merged.load_state_dict(sd, strict=True)
+    embeds = torch.randn(1, 5, 64)
+    positions = qwen2vl_mrope_position_ids([], 5, "cpu")
+    for mtp in (False, True):
+        assert merged.generate(embeds.clone(), do_sample=False, max_length=20, mtp=mtp, position_ids=positions) == \
+            split.generate(embeds.clone(), do_sample=False, max_length=20, mtp=mtp, position_ids=positions)
+
+    # LoRAs trained on the split checkpoint patch the matching rows of the merged weights
+    lora = {}
+    for key, rows in (("model.layers.3.self_attn.k_proj", 64), ("mtp.layers.0.self_attn.q_proj", 256), ("model.layers.0.mlp.up_proj", 128)):
+        lora["text_encoders.{}.lora_up.weight".format(key)] = torch.randn(rows, 2)
+        lora["text_encoders.{}.lora_down.weight".format(key)] = torch.randn(2, 64)
+    split_w, merged_w = _patched_weights(split, lora), _patched_weights(merged, lora)
+    for prefix in ("model.layers.3.", "mtp.layers.0."):
+        expected = torch.cat([split_w["{}self_attn.{}_proj.weight".format(prefix, n)] for n in "qkv"])
+        torch.testing.assert_close(merged_w[prefix + "self_attn.qkv_proj.weight"], expected)
+    expected = torch.cat([split_w["model.layers.0.mlp.{}_proj.weight".format(n)] for n in ("gate", "up")])
+    torch.testing.assert_close(merged_w["model.layers.0.mlp.gate_up_proj.weight"], expected)
+    assert not torch.equal(merged_w["model.layers.3.self_attn.qkv_proj.weight"], sd["model.layers.3.self_attn.qkv_proj.weight"])

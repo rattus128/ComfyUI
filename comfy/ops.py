@@ -507,6 +507,8 @@ class CastWeightBiasOp:
     comfy_force_forward = False
     weight_function = []
     bias_function = []
+    # ((member name, rows), ...) of a weight concatenated from sibling projections, for LoRA mapping
+    comfy_merged_from = None
 
 class disable_weight_init:
     @staticmethod

@@ -20,6 +20,7 @@ import comfy.memory_management
 import comfy.utils
 import comfy.model_management
 import comfy.model_base
+import comfy.ops
 import comfy.weight_adapter as weight_adapter
 import logging
 import torch
@@ -186,6 +187,21 @@ def model_lora_keys_clip(model, key_map={}):
     k = "clip_l.transformer.text_projection.weight"
     if k in sdk:
         key_map["lora_te1_text_projection"] = k #OneTrainer SD3 lora, not necessary but omits warning
+
+    # projections concatenated at load: LoRAs address the original members as row slices
+    lora_keys = {}
+    for lora_key, k in key_map.items():
+        lora_keys.setdefault(k, []).append(lora_key)
+    for name, module in model.named_modules():
+        if isinstance(module, comfy.ops.CastWeightBiasOp) and module.comfy_merged_from is not None:
+            k = name + ".weight"
+            merged = name.rsplit(".", 1)[-1]
+            offset = 0
+            for member, rows in module.comfy_merged_from:
+                for lora_key in lora_keys.get(k, []):
+                    if lora_key.endswith(merged):
+                        key_map[lora_key[:-len(merged)] + member] = (k, (0, offset, rows))
+                offset += rows
 
     return key_map
 

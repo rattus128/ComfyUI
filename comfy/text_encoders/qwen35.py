@@ -86,6 +86,53 @@ class LinearKV(FixedKV):
 def _qwen35_layer_types(n):
     return [("full_attention" if (i + 1) % 4 == 0 else "linear_attention") for i in range(n)]
 
+
+MERGED_PROJECTIONS = {
+    "merged_qkv": ("self_attn.qkv_proj", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
+    "merged_mlp": ("mlp.gate_up_proj", ("mlp.gate_proj", "mlp.up_proj")),
+}
+
+
+def _merge_group(state_dict, prefix, members):
+    # Every supported stored layout quantizes output rows independently: row-major tensors
+    # concatenate, shared metadata (comfy_quant, codebook, tensorwise scales) must match exactly.
+    bases = [prefix + member for member in members]
+    names = [sorted(k[len(base) + 1:] for k in state_dict if k.startswith(base + ".")) for base in bases]
+    if any(n != names[0] for n in names[1:]):
+        return None
+    rows = [state_dict[base + ".weight"].shape[0] for base in bases]
+    group = {}
+    for name in names[0]:
+        parts = [state_dict["{}.{}".format(base, name)] for base in bases]
+        if any(p.dtype != parts[0].dtype for p in parts):
+            return None
+        if name != "comfy_quant" and all(p.ndim > 0 and p.shape[0] == n and p.shape[1:] == parts[0].shape[1:] for p, n in zip(parts, rows)):
+            group[name] = parts
+        elif all(p.shape == parts[0].shape and torch.equal(p, parts[0]) for p in parts[1:]):
+            group[name] = parts[:1]
+        else:
+            return None
+    return group
+
+
+def merge_projections(state_dict):
+    """Concatenate the sibling projections of one input into a single weight, in place, so a
+    decode step runs one GEMM per group and the block's pre-norm and SwiGLU fold into its
+    activation quantizer. A group type merges in every layer or in none. Returns the config flags."""
+    config = {}
+    for flag, (merged, members) in MERGED_PROJECTIONS.items():
+        suffix = ".{}.weight".format(members[0])
+        prefixes = [k[:-len(suffix) + 1] for k in state_dict if k.endswith(suffix)]
+        groups = [_merge_group(state_dict, prefix, members) for prefix in prefixes]
+        if all(group is not None for group in groups):
+            for prefix, group in zip(prefixes, groups):
+                for name, parts in group.items():
+                    for member in members:
+                        del state_dict["{}{}.{}".format(prefix, member, name)]
+                    state_dict["{}{}.{}".format(prefix, merged, name)] = torch.cat(parts) if len(parts) > 1 else parts[0]
+        config[flag] = not any(k.endswith(suffix) for k in state_dict) and any(k.endswith(".{}.weight".format(merged)) for k in state_dict)
+    return config
+
 @dataclass
 class Qwen35Config:
     vocab_size: int = 248320
@@ -120,6 +167,8 @@ class Qwen35Config:
     rope_dims: list = None
     rope_scale: float = None
     mtp: bool = False
+    merged_qkv: bool = False
+    merged_mlp: bool = False
 
 QWEN35_VISION_DEFAULTS = dict(hidden_size=1024, num_heads=16, intermediate_size=4096, depth=24, patch_size=16, temporal_patch_size=2, in_channels=3, spatial_merge_size=2, num_position_embeddings=2304)
 
@@ -339,12 +388,18 @@ class GatedAttention(nn.Module):
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.inner_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.rotary_dim = int(self.head_dim * config.partial_rotary_factor)
 
         # q_proj outputs 2x: query + gate
-        self.q_proj = ops.Linear(config.hidden_size, self.inner_size * 2, bias=config.qkv_bias, device=device, dtype=dtype)
-        self.k_proj = ops.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.qkv_bias, device=device, dtype=dtype)
-        self.v_proj = ops.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.qkv_bias, device=device, dtype=dtype)
+        self.merged_qkv = config.merged_qkv
+        if self.merged_qkv:
+            self.qkv_proj = ops.Linear(config.hidden_size, self.inner_size * 2 + self.kv_size * 2, bias=config.qkv_bias, device=device, dtype=dtype)
+            self.qkv_proj.comfy_merged_from = (("q_proj", self.inner_size * 2), ("k_proj", self.kv_size), ("v_proj", self.kv_size))
+        else:
+            self.q_proj = ops.Linear(config.hidden_size, self.inner_size * 2, bias=config.qkv_bias, device=device, dtype=dtype)
+            self.k_proj = ops.Linear(config.hidden_size, self.kv_size, bias=config.qkv_bias, device=device, dtype=dtype)
+            self.v_proj = ops.Linear(config.hidden_size, self.kv_size, bias=config.qkv_bias, device=device, dtype=dtype)
         self.o_proj = ops.Linear(self.inner_size, config.hidden_size, bias=False, device=device, dtype=dtype)
 
         # QK norms with (1+weight) scaling
@@ -365,31 +420,47 @@ class GatedAttention(nn.Module):
             shared[cache_type] = cache_type.shared(batch, device)
         return cache_type.zeros(batch, self.num_kv_heads, capacity, self.head_dim, device, dtype, shared[cache_type])
 
-    def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
+    def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None, norm=None):
+        # norm: the block's pre-norm, folded into the merged projection's input quantizer where supported
         batch_size, seq_length, _ = x.shape
 
         # Project Q (with gate), K, V
-        qg = self.q_proj(x)
+        if self.merged_qkv:
+            if norm is not None:
+                qkv = comfy.ops.linear_input_act(self.qkv_proj, x, "rms_norm", norm.scale(), norm.eps)
+            else:
+                qkv = self.qkv_proj(x)
+            qg, xk, xv = qkv.split((self.inner_size * 2, self.kv_size, self.kv_size), dim=-1)
+        else:
+            if norm is not None:
+                x = norm(x)
+            qg, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         # Split into query and gate: each is [B, seq, inner_size]
         qg = qg.view(batch_size, seq_length, self.num_heads, self.head_dim * 2)
         xq, gate = qg[..., :self.head_dim], qg[..., self.head_dim:]
         gate = gate.reshape(batch_size, seq_length, -1)  # [B, seq, inner_size]
 
-        xk = self.k_proj(x)
-        xv = self.v_proj(x)
-
-        xq = self.q_norm(xq).transpose(1, 2)  # [B, heads, seq, head_dim]
-        xk = self.k_norm(xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-        xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # Apply partial RoPE
-        xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim)
-
-        # KV cache
+        xk = xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
         present_key_value = past_key_value
         decode = past_key_value is not None and seq_length <= 6 and attention_mask is None
-        if decode:
-            past_key_value.write(xk, xv)
+        if decode and x.dtype == torch.bfloat16 and comfy_kitchen.rms_rope_kv_decode_is_available(x.device):
+            matrix = rope_matrix(freqs_cis)
+            if matrix.ndim == 5:
+                matrix = matrix.unsqueeze(0)
+            position = past_key_value.position[:seq_length].remainder(past_key_value.key.shape[2])
+            xq, xk = comfy_kitchen.rms_rope_kv_decode(
+                xq, xk, xv, matrix, comfy.ops.cast_to_input(self.q_norm.scale(), x, copy=False),
+                comfy.ops.cast_to_input(self.k_norm.scale(), x, copy=False), past_key_value.key, past_key_value.value,
+                position.view(1, seq_length), self.q_norm.eps)
+            xv = xv.transpose(1, 2)
+        else:
+            xq = self.q_norm(xq).transpose(1, 2)
+            xk = self.k_norm(xk).transpose(1, 2)
+            xv = xv.transpose(1, 2)
+            xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim)
+            if decode:
+                past_key_value.write(xk, xv)
 
         if decode and (isinstance(past_key_value, Int8FixedKVCache) or
                        self.comfy_attention.method is None and not comfy.model_management.comfy_kitchen_attention_enabled()):
@@ -429,7 +500,7 @@ class Qwen35TransformerBlock(nn.Module):
         if self.layer_type == "linear_attention":
             h, present_key_value = self.linear_attn(self.input_layernorm(x), attention_mask=attention_mask, past_key_value=past_key_value)
         else:
-            h, present_key_value = self.self_attn(self.input_layernorm(x), attention_mask=attention_mask, freqs_cis=freqs_cis, optimized_attention=optimized_attention, past_key_value=past_key_value)
+            h, present_key_value = self.self_attn(x, attention_mask=attention_mask, freqs_cis=freqs_cis, optimized_attention=optimized_attention, past_key_value=past_key_value, norm=self.input_layernorm)
 
         # in-place into the input buffer so CUDA-graph replays land in the static x
         x = torch.add(x, h, out=output)
@@ -1079,12 +1150,12 @@ class Qwen35ImageTokenizer(sd1_clip.SD1Tokenizer):
 
 
 class Qwen35ClipModel(sd1_clip.SDClipModel):
-    def __init__(self, device="cpu", layer="hidden", layer_idx=-2, dtype=None, attention_mask=True, model_options={}, model_type="qwen35_2b", mtp=False):
+    def __init__(self, device="cpu", layer="hidden", layer_idx=-2, dtype=None, attention_mask=True, model_options={}, model_type="qwen35_2b", model_config={}):
         class Qwen35_(Qwen35):
             pass
         Qwen35_.model_type = model_type
 
-        super().__init__(device=device, layer=layer, layer_idx=layer_idx, textmodel_json_config={"mtp": True} if mtp else {},
+        super().__init__(device=device, layer=layer, layer_idx=layer_idx, textmodel_json_config=model_config,
             dtype=dtype, special_tokens={"pad": 248044}, layer_norm_hidden_state=False,
             model_class=Qwen35_, enable_attention_masks=attention_mask, return_attention_masks=attention_mask, model_options=model_options)
 
@@ -1099,8 +1170,8 @@ class Qwen35ClipModel(sd1_clip.SDClipModel):
 
 
 class Qwen35TEModel(sd1_clip.SD1ClipModel):
-    def __init__(self, device="cpu", dtype=None, model_options={}, model_type="qwen35_2b", mtp=False):
-        clip_model = lambda **kw: Qwen35ClipModel(**kw, model_type=model_type, mtp=mtp)
+    def __init__(self, device="cpu", dtype=None, model_options={}, model_type="qwen35_2b", model_config={}):
+        clip_model = lambda **kw: Qwen35ClipModel(**kw, model_type=model_type, model_config=model_config)
         super().__init__(device=device, dtype=dtype, name=model_type, clip_model=clip_model, model_options=model_options)
 
 
@@ -1111,7 +1182,7 @@ def tokenizer(model_type="qwen35_2b"):
     return Qwen35ImageTokenizer_
 
 
-def te(dtype_llama=None, llama_quantization_metadata=None, model_type="qwen35_2b", mtp=False):
+def te(dtype_llama=None, llama_quantization_metadata=None, model_type="qwen35_2b", model_config={}):
     class Qwen35TEModel_(Qwen35TEModel):
         def __init__(self, device="cpu", dtype=None, model_options={}):
             if dtype_llama is not None:
@@ -1119,5 +1190,5 @@ def te(dtype_llama=None, llama_quantization_metadata=None, model_type="qwen35_2b
             if llama_quantization_metadata is not None:
                 model_options = model_options.copy()
                 model_options["quantization_metadata"] = llama_quantization_metadata
-            super().__init__(device=device, dtype=dtype, model_options=model_options, model_type=model_type, mtp=mtp)
+            super().__init__(device=device, dtype=dtype, model_options=model_options, model_type=model_type, model_config=model_config)
     return Qwen35TEModel_
