@@ -73,6 +73,7 @@ def malloc_graph_begin(device):
             comfy.model_management.current_stream(device), args.assert_graph_breaks
         )
         graph._comfy_cuda_graph_modules = weakref.WeakSet()
+        graph._comfy_retired_cuda_graphs = []
         MALLOC_GRAPHS[thread_id] = graph
     else:
         graph.push()
@@ -98,7 +99,14 @@ def cleanup_malloc_graph():
             graph.abort()
             graph._comfy_active = False
         for module in graph._comfy_cuda_graph_modules:
-            _drop_graph(module)
+            _drop_graph(module, graph)
+
+        # Explicit reset keeps PyTorch's "uncaptured free" warnings catchable.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for retired in graph._comfy_retired_cuda_graphs:
+                retired.reset()
+        graph._comfy_retired_cuda_graphs.clear()
         MALLOC_GRAPH_ROGUES += graph.rogue_count
         del graph
 
@@ -136,16 +144,13 @@ def cleanup_prefetched_modules(module, comfy_modules):
         comfy_aimdo.model_vbar.vbar_unpin(module._v_block)
         del module._v_block_faulted
 
-def _drop_graph(module):
+def _drop_graph(module, malloc_graph):
     graph = getattr(module, "_comfy_graph", None)
     if graph is None:
         return
-    # reset() through the bound method surfaces the allocator's benign
-    # "uncaptured free of a captured allocation" as catchable Python warnings;
-    # a plain del frees from the C++ dealloc path and spams stderr instead
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        graph["graph"].reset()
+    # PyTorch 2.13 reset() frees the capture stream's shared cuBLAS workspace.
+    # Keep it alive until every graph using that stream is discarded.
+    malloc_graph._comfy_retired_cuda_graphs.append(graph["graph"])
     del module._comfy_graph
 
 def cleanup_prefetch_queues():
@@ -245,7 +250,7 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
                 if signature is not None:
                     module._v_block_faulted = True
             if signature is not None:
-                _drop_graph(module)
+                _drop_graph(module, malloc_graph)
                 malloc_graph.pause()
                 graph = torch.cuda.CUDAGraph()
                 if generator is not None:
