@@ -512,18 +512,27 @@ class GatedAttention(nn.Module):
         xk = self.k_proj(x)
         xv = self.v_proj(x)
 
-        xq = self.q_norm(xq).transpose(1, 2)  # [B, heads, seq, head_dim]
-        xk = self.k_norm(xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-        xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # Apply partial RoPE
-        xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim)
-
-        # KV cache
+        xk = xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
         present_key_value = past_key_value
         decode = past_key_value is not None and seq_length <= SPEC_ROWS and attention_mask is None
-        if decode:
-            past_key_value.write(xk, xv)
+        if decode and x.dtype == torch.bfloat16 and comfy_kitchen.rms_rope_kv_decode_is_available(x.device):
+            matrix = rope_matrix(freqs_cis)
+            if matrix.ndim == 5:
+                matrix = matrix.unsqueeze(0)
+            position = past_key_value.position[:seq_length].remainder(past_key_value.key.shape[2])
+            xq, xk = comfy_kitchen.rms_rope_kv_decode(
+                xq, xk, xv, matrix, comfy.ops.cast_to_input(self.q_norm.scale(), x, copy=False),
+                comfy.ops.cast_to_input(self.k_norm.scale(), x, copy=False), past_key_value.key, past_key_value.value,
+                position.view(1, seq_length), self.q_norm.eps)
+            xv = xv.transpose(1, 2)
+        else:
+            xq = self.q_norm(xq).transpose(1, 2)
+            xk = self.k_norm(xk).transpose(1, 2)
+            xv = xv.transpose(1, 2)
+            xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim)
+            if decode:
+                past_key_value.write(xk, xv)
 
         if decode and self.kernel_attend(past_key_value):
             output = past_key_value.attend(xq, xk, xv)
