@@ -684,3 +684,42 @@ def test_configured_decode_preserves_causal_and_tree_visibility(monkeypatch, seq
     default, _ = attn(x, attention_mask=mask, freqs_cis=freqs, optimized_attention=attention.attention_pytorch)
     assert default.abs().max() > 0
     torch.testing.assert_close(configured, default * 0.25)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA decode fusion")
+@pytest.mark.parametrize("seq", [1, 6])
+@pytest.mark.parametrize("int8_cache", [False, True])
+def test_fused_qk_decode_matches_unfused_after_rollback(monkeypatch, seq, int8_cache):
+    import comfy.ldm.modules.attention as attention
+    import comfy.text_encoders.qwen35 as qwen35
+
+    assert qwen35.comfy_kitchen.rms_rope_kv_decode_is_available("cuda")
+    monkeypatch.setattr(cli_args, "use_ck_attention", int8_cache)
+    torch.manual_seed(35)
+    attn = _gated_attention().cuda().requires_grad_(False)
+    capacity, prefix_length = (1600, 1534) if int8_cache else (32, 20)
+    caches = [attn.init_kv_cache(2, capacity, torch.device("cuda"), torch.bfloat16, {}) for _ in range(2)]
+    assert all(isinstance(kv, qwen35.Int8FixedKVCache) == int8_cache for kv in caches)
+    prefix = torch.randn(2, prefix_length, 32, device="cuda", dtype=torch.bfloat16)
+    freqs = torch.randn(2, 1, prefix_length, attn.rotary_dim // 2, 2, 2, device="cuda")
+    mask = torch.full((prefix_length, prefix_length), -torch.inf, device="cuda", dtype=prefix.dtype).triu(1)
+    for kv in caches:
+        kv.prepare(prefix_length)
+        attn(prefix, attention_mask=mask, freqs_cis=freqs,
+             optimized_attention=attention.attention_pytorch, past_key_value=kv)
+        kv.advance(prefix_length)
+
+    available = qwen35.comfy_kitchen.rms_rope_kv_decode_is_available
+    for start in (prefix_length, prefix_length - 3):
+        current = torch.randn(2, seq, 32, device="cuda", dtype=torch.bfloat16)
+        freqs = torch.randn(2, 1, seq, attn.rotary_dim // 2, 2, 2, device="cuda")
+        outputs = []
+        for fused, kv in zip((False, True), caches):
+            monkeypatch.setattr(qwen35.comfy_kitchen, "rms_rope_kv_decode_is_available",
+                                available if fused else lambda device: False)
+            kv.index = start
+            kv.prepare(seq)
+            outputs.append(attn(current, freqs_cis=freqs, past_key_value=kv)[0])
+        assert torch.equal(outputs[0], outputs[1])
+        assert torch.equal(caches[0].key, caches[1].key)
+        assert torch.equal(caches[0].value, caches[1].value)
