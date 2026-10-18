@@ -187,6 +187,7 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
             fully_faulted = False
         prefetch = {
             "signature": signature,
+            "signature_hit": resident,
             "resident": resident,
         }
 
@@ -291,6 +292,11 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
     if prefetch["resident"]:
         weight = s._v_weight
         bias = s._v_bias
+        if (prefetch["signature_hit"] and isinstance(s, MixedPrecisionOp) and s.comfy_gemv_optimized
+                and isinstance(weight, QuantizedTensor) and not s._full_precision_mm
+                and not s.comfy_force_forward and not s.weight_function):
+            storage = comfy_aimdo.torch.aimdo_to_tensor(s._v, device)
+            s._v_weight = weight = weight.optimize_for_gemv(storage)
     else:
         xfer_dest = prefetch["xfer_dest"]
         if prefetch["needs_cast"]:
@@ -305,13 +311,8 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
         weight = params[0]
         bias = params[1]
         if prefetch["signature"] is not None:
-            # FIXME: Make this non_gemv_specific.
-            if (isinstance(s, MixedPrecisionOp) and s.comfy_gemv_optimized and isinstance(weight, QuantizedTensor) and not s._full_precision_mm
-                    and s.weight_lowvram_function is None and len(s.weight_function) == 0):
-                weight = weight.optimize_for_gemv(xfer_dest)
             s._v_weight = weight
             s._v_bias = bias
-        s._v_signature = prefetch["signature"]
 
     def post_cast(s, param_key, x, dtype, resident, update_weight):
         lowvram_fn = getattr(s, param_key + "_lowvram_function", None)
@@ -352,6 +353,7 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
     if bias is not None:
         bias = post_cast(s, "bias", bias, bias_dtype, prefetch["resident"], update_weight)
 
+    s._v_signature = prefetch["signature"]
     if prefetch["signature"] is not None:
         prefetch["resident"] = True
 
