@@ -273,6 +273,10 @@ def pin_modules(comfy_modules, device, dtype=None):
     if not (comfy_modules and comfy_modules[0]._pin_state["fast_disk"]):
         comfy.model_management.ensure_pin_registerable(registerable_size)
     comfy.model_management.sync_stream(device, offload_stream)
+    if dtype is not None:
+        groups = dict.fromkeys(s._combined_linear for s in comfy_modules if hasattr(s, "_combined_linear"))
+        for group in groups:
+            group.prepare(device)
     if fully_faulted and dtype is not None:
         for comfy_module in comfy_modules:
             comfy.ops.resolve_cast_module_with_vbar(comfy_module, dtype, device, dtype, None, False, return_weights=False)
@@ -370,6 +374,7 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
         if signature is not None:
             module._v_block_faulted = True
             graph_hit = comfy_aimdo.model_vbar.vbar_signature_compare(signature, graph["signature"])
+            graph_hit = graph_hit and all(group.weight is weight for group, weight in graph["combined_weights"])
 
     if malloc_graph is not None and malloc_scope is not None:
         if malloc_graph.iterate(malloc_scope if module is not None and not graph_hit else None):
@@ -434,7 +439,9 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
                 malloc_graph.resume(sync=True)
                 comfy.model_management.current_stream(device).wait_stream(capture_stream)
                 graph.replay()
-                module._comfy_graph = {"graph": graph, "signature": signature}
+                groups = dict.fromkeys(s._combined_linear for s in comfy_modules if hasattr(s, "_combined_linear"))
+                module._comfy_graph = {"graph": graph, "signature": signature,
+                                       "combined_weights": [(group, group.weight) for group in groups]}
                 malloc_graph._comfy_cuda_graph_modules.add(module)
                 return
         if capture_stream is None:

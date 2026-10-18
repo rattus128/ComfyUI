@@ -180,8 +180,17 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
         cast_buffer_offset += buffer_size
         return buffer
 
+    signatures = {s: comfy_aimdo.model_vbar.vbar_fault(s._v) for s in comfy_modules}
+    groups = {s._combined_linear for s in comfy_modules if hasattr(s, "_combined_linear")}
+    for group in groups:
+        if group.weight is not None and not all(
+            s in signatures and comfy_aimdo.model_vbar.vbar_signature_compare(signatures[s], s._v_signature)
+            for s in group.linears
+        ):
+            group.invalidate()
+
     for s in comfy_modules:
-        signature = comfy_aimdo.model_vbar.vbar_fault(s._v)
+        signature = signatures[s]
         resident = comfy_aimdo.model_vbar.vbar_signature_compare(signature, s._v_signature)
         if return_faulted and (signature is None or not resident):
             fully_faulted = False
@@ -292,11 +301,15 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
     if prefetch["resident"]:
         weight = s._v_weight
         bias = s._v_bias
+        group = getattr(s, "_combined_linear", None)
         if (prefetch["signature_hit"] and isinstance(s, MixedPrecisionOp) and s.comfy_gemv_optimized
                 and isinstance(weight, QuantizedTensor) and not s._full_precision_mm
-                and not s.comfy_force_forward and not s.weight_function):
+                and not s.comfy_force_forward and not s.weight_function
+                and (group is None or group.weight is None)):
             storage = comfy_aimdo.torch.aimdo_to_tensor(s._v, device)
-            s._v_weight = weight = weight.optimize_for_gemv(storage)
+            relayout = quant_ops.ck.try_relayout_weights((weight,), storage)
+            if relayout is not NotImplemented:
+                s._v_weight = weight = relayout[0]
     else:
         xfer_dest = prefetch["xfer_dest"]
         if prefetch["needs_cast"]:
@@ -1080,8 +1093,71 @@ def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_
         )
 
 
+class CombinedLinear:
+    """A residency-scoped combination, not another parameter-owning module.
+
+    Execution never falls back to its members: the model owns the split path.
+    """
+    def __init__(self, linears):
+        self.linears = tuple(linears)
+        self.weight = None
+        for linear in self.linears:
+            linear._combined_linear = self
+
+    def invalidate(self):
+        self.weight = None
+        # Relayout moves bytes across member allocations. A partial miss therefore
+        # requires canonical reload of every member, including still-mapped pages.
+        for linear in self.linears:
+            linear._v_signature = None
+
+    def prepare(self, device):
+        if self.weight is not None:
+            return
+        weights = []
+        for s in self.linears:
+            prefetch = getattr(s, "_prefetch", None)
+            if (prefetch is None or not prefetch["signature_hit"] or s.bias is not None
+                    or getattr(s, "_full_precision_mm", False)
+                    or getattr(s, "comfy_force_forward", False)
+                    or s.weight_function):
+                return
+            weights.append(s._v_weight)
+        first = self.linears[0]._v
+        end = first[1]
+        for s in self.linears:
+            vbar, start, size = s._v
+            if vbar is not first[0] or start != end:
+                return
+            end += size
+        storage = comfy_aimdo.torch.aimdo_to_tensor((first[0], first[1], end - first[1]), device)
+        relayout = quant_ops.ck.try_relayout_weights(weights, storage)
+        if relayout is NotImplemented:
+            return
+        self.weight, views = relayout
+        for s, weight in zip(self.linears, views):
+            s._v_weight = weight
+            s._v_bias = None
+
+    def forward(self, x):
+        return self.linear_input_act(x, None)
+
+    def linear_input_act(self, x, input_act, act_weight=None, act_eps=0.0,
+                         residual=None, residual_scale=None):
+        run_every_op()
+        if self.weight is None or self.weight.device != x.device:
+            return NotImplemented
+        if not all(getattr(s, "_prefetch", None) is not None and s._prefetch["resident"]
+                   for s in self.linears):
+            return NotImplemented
+        return _try_quantized_linear_input_act(x, self.weight, None, input_act, act_weight, act_eps,
+                                               residual, residual_scale)
+
+
 def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
                      residual=None, residual_scale=None):
+    if isinstance(linear, CombinedLinear):
+        return linear.linear_input_act(x, input_act, act_weight, act_eps, residual, residual_scale)
     run_every_op()
     weight = linear.weight
     quantized = isinstance(weight, QuantizedTensor)

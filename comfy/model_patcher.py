@@ -2008,6 +2008,9 @@ class ModelPatcherDynamic(ModelPatcher):
                 def set_dirty(item, dirty):
                     if dirty or not hasattr(item, "_v_signature"):
                         item._v_signature = None
+                        group = getattr(item, "_combined_linear", None)
+                        if group is not None and group.weight is not None:
+                            group.invalidate()
 
                 def setup_param(self, m, n, param_key):
                     nonlocal num_patches
