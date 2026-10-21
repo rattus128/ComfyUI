@@ -90,10 +90,9 @@ on:
 
 jobs:
   package_comfy_windows:
+    if: github.repository == 'rattus128/ComfyUI'
     permissions:
-      contents: "write"
-      packages: "write"
-      pull-requests: "read"
+      contents: "read"
     runs-on: ${{ inputs.python_arch == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
@@ -178,10 +177,10 @@ jobs:
 
           ls
 
-      - name: Upload binaries to release
-        uses: softprops/action-gh-release@v2
+      - name: Upload test portable
+        uses: actions/upload-artifact@v4
         with:
-          files: ComfyUI_windows_portable_${{ inputs.rel_name }}${{ inputs.rel_extra_name }}.7z
-          tag_name: ${{ inputs.git_tag }}
-          draft: true
-          overwrite_files: true
+          name: ComfyUI_windows_portable_${{ inputs.rel_name }}${{ inputs.rel_extra_name }}
+          path: ComfyUI_windows_portable_${{ inputs.rel_name }}${{ inputs.rel_extra_name }}.7z
+          compression-level: 0
+          if-no-files-found: error
