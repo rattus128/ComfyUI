@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import types
 
@@ -408,6 +409,79 @@ def test_adaptive_switch_preserves_sequential_output(monkeypatch, sampled):
     expected = model.generate(embeds.clone(), mtp=False, **settings)
     assert model.generate(embeds.clone(), mtp=True, **settings) == expected
     assert len(set(switches)) == 4, switches
+
+
+def test_prefetch_ring_regions_order_credits_and_residency(monkeypatch):
+    import comfy.model_prefetch as mp
+    from comfy.text_encoders.llama import FixedKVCache
+    monkeypatch.setattr(mp.ck, "prefetch_ring", types.SimpleNamespace(CREDIT_KV=1, CREDIT_DELTA=2, SELF_CREDIT=1), raising=False)
+    kv = FixedKVCache.zeros(1, 2, 32, 256, "cpu", torch.bfloat16, FixedKVCache.shared(1, "cpu"))
+    kv.index = 5
+    plain = torch.nn.Linear(4, 4)
+    plain._v_weight, plain._v_bias = torch.zeros(16, 16), None
+    resident = torch.nn.Linear(4, 4)
+    resident._v_weight, resident._v_bias = torch.zeros(8, 16), torch.zeros(8)
+
+    class Layer(torch.nn.Module):
+        def prefetch_reads(self, cache):
+            return [cache, plain, None, resident]
+    regions, kv_rows, credits = mp._prefetch_ring_regions([Layer()], [kv], 2)
+    row_bytes = 7 * 256 * 2
+    assert [size for _, size, _ in regions[:4]] == [row_bytes] * 4 and kv_rows == [0, 1, 2, 3] and credits == 1
+    assert [flags for _, _, flags in regions[:4]] == [0] * 4 and [flags for _, _, flags in regions[4:]] == [1] * 3
+    assert regions[4][0] == plain._v_weight.data_ptr() and regions[6][0] == resident._v_bias.data_ptr()
+
+    # Tree attention reads the prefix here; its current rows are read by tree_merge.
+    kv.tracker["tree"] = types.SimpleNamespace(rows=7)
+    assert [size for _, size in kv.prefetch_regions(7)] == [5 * 256 * 2] * 4
+    assert [size for _, size in kv.prefetch_regions(1)] == [6 * 256 * 2] * 4
+
+    from comfy.quant_ops import QuantizedTensor
+    evicted = torch.nn.Module()
+    evicted.weight = QuantizedTensor.from_float(torch.randn(32, 256), "AsymW4A8Int8Layout")
+    evicted._v_bias = None
+
+    class Evicted(torch.nn.Module):
+        def prefetch_reads(self, cache):
+            return [cache, evicted]
+    assert mp._prefetch_ring_regions([Evicted()], [kv], 2)[0] is None
+
+    # only the packed small-M W4A8 decode weight is listed; the canonical layout is left to demand
+    canonical = torch.nn.Module()
+    canonical.weight = canonical._v_weight = evicted.weight
+    canonical._v_bias = None
+    packed = torch.nn.Module()
+    packed.weight = packed._v_weight = QuantizedTensor(
+        evicted.weight._qdata, "AsymW4A8Int8Layout",
+        dataclasses.replace(evicted.weight._params, scale=evicted.weight._params.scale.new_empty(0), mma_packed=True))
+    packed._v_bias = None
+
+    class W4A8(torch.nn.Module):
+        def prefetch_reads(self, cache):
+            return [canonical, packed]
+    regions, _, _ = mp._prefetch_ring_regions([W4A8()], [kv], 2)
+    assert regions == [(evicted.weight._qdata.data_ptr(), evicted.weight._qdata.numel(), 0)]
+    assert mp._prefetch_ring_regions([W4A8()], [kv], 9)[0] == []
+
+
+def test_prefetch_reads_list_kv_only_for_kernel_attention(monkeypatch):
+    # configured attention reads the cache without crediting the ring
+    model = _tiny_model(monkeypatch)
+    layer = model.model.layers[3]
+    kv = model.init_kv_cache(1, 32, torch.device("cpu"), torch.float32)[3]
+    assert layer.prefetch_reads(kv)[0] is kv
+    monkeypatch.setattr(cli_args, "use_ck_attention", True)
+    assert layer.prefetch_reads(kv)[0] is None
+
+
+def test_prefetch_ring_needs_graph_replay(monkeypatch):
+    import comfy.model_prefetch as mp
+    stopped = []
+    monkeypatch.setattr(mp, "_stop_prefetch_ring", lambda: stopped.append(True))
+    monkeypatch.setattr(mp.ck, "prefetch_ring_is_available", lambda: True, raising=False)
+    layers = torch.nn.ModuleList()
+    mp.prefetch_ring_begin(layers, "cpu", 1, [])
+    assert stopped and not hasattr(layers, "_prefetch_ring_seen")
 
 
 class _FakePacked:
