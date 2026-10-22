@@ -143,6 +143,12 @@ jobs:
             rm ./Lib/site-packages/torch/lib/libprotobuf.lib
           fi
 
+          if test -d ./Lib/site-packages/_rocm_sdk_core/lib/llvm/bin; then
+            rm -r ./Lib/site-packages/_rocm_sdk_core/lib/llvm/bin #ROCm LLVM toolchain, runtime JIT uses amd_comgr.dll not these
+            rm -r ./Lib/site-packages/_rocm_sdk_core/lib/llvm/lib
+            rm ./Lib/site-packages/_rocm_sdk_core/bin/hipify-clang.exe
+          fi
+
           cd ..
 
           git clone --depth 1 https://github.com/comfyanonymous/taesd
