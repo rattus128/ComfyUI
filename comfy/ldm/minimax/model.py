@@ -514,6 +514,9 @@ class MiniMaxH3Model(nn.Module):
                      time_embed_dim, norm_eps, qk_norm_eps, **curve, gate_compress=gate_compress,
                      dtype=dtype, device=device, operations=operations)
             for _ in range(num_layers)])
+        for m in self.blocks.modules():
+            if isinstance(m, comfy.ops.MixedPrecisionOp):
+                m.comfy_gemm_optimized = True
         self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_patch_dim, audio_latents_dim,
                                       final_norm_eps, **curve, pdd_steps=pdd_steps, dtype=dtype, device=device, operations=operations)
 

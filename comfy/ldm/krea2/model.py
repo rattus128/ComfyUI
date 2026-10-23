@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 import comfy.model_management
+import comfy.ops
 import comfy.patcher_extension
 import comfy.ldm.common_dit
 import comfy.utils
@@ -256,6 +257,9 @@ class SingleStreamDiT(nn.Module):
             SingleStreamBlock(features, heads, multiplier, bias, kvheads, device=device, dtype=dtype, operations=operations)
             for _ in range(layers)
         ])
+        for m in self.blocks.modules():
+            if isinstance(m, comfy.ops.MixedPrecisionOp):
+                m.comfy_gemm_optimized = True
         self.tmlp = nn.Sequential(
             operations.Linear(tdim, features, device=device, dtype=dtype),
             nn.GELU(approximate="tanh"),

@@ -337,6 +337,9 @@ class QwenImage21Transformer2DModel(nn.Module):
             QwenImage21TransformerBlock(self.inner_dim, num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, eps=eps, fused_mlp=fused_mlp, dtype=dtype, device=device, operations=operations)
             for _ in range(num_layers)
         ])
+        for m in self.transformer_blocks.modules():
+            if isinstance(m, comfy.ops.MixedPrecisionOp):
+                m.comfy_gemm_optimized = True
 
         self.norm_out = LastLayer(self.inner_dim, eps=eps, dtype=dtype, device=device, operations=operations)
         self.proj_out = operations.Linear(self.inner_dim, out_channels, bias=False, dtype=dtype, device=device)
