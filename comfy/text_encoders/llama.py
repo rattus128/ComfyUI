@@ -1179,10 +1179,9 @@ class BaseGenerate:
     def logits(self, x):
         input = x[:, -1:]
         if hasattr(self.model, "lm_head"):
-            module = self.model.lm_head
-        else:
-            module = self.model.embed_tokens
+            return self.model.lm_head(input.flatten(0, -2)).reshape(*input.shape[:-1], -1)
 
+        module = self.model.embed_tokens
         if not module.comfy_cast_weights:
             return torch.nn.functional.linear(input, module.weight.to(x), None)
         with comfy.ops.CastBiasWeightContext(module, input, offloadable=True) as (weight, _bias):
