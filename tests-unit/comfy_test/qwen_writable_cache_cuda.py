@@ -98,6 +98,7 @@ with torch.inference_mode(), tempfile.TemporaryDirectory() as tmp:
                 baseline = None
                 for mode in ("hard", "resident", "ram", "disk", "evict"):
                     mm.DISABLE_PINNED_MEMORY = mode == "disk"
+                    states.clear()
                     outputs.clear()
                     captured.clear()
                     # The resident run is saved to a named file; the others stay anonymous.
@@ -105,22 +106,25 @@ with torch.inference_mode(), tempfile.TemporaryDirectory() as tmp:
                     state = _ModeState(mode)
                     mm.register_ephemeral_model(state)
                     ids = model.generate(embeds.clone(), do_sample=True, seed=71, max_length=24, mtp=mtp, model_state=state)
-                    # A consumer flushes the values back to CPU tensors, which drops the loaded model.
+                    # A snapshot does not unload its managed model.
                     dead = [weakref.ref(s.patcher) for s in states] + [weakref.ref(s.patcher.model) for s in states]
                     states.clear()
+                    loaded_patcher = state.patcher
                     state.flush()
-                    assert state.patcher is None
+                    assert state.patcher is loaded_patcher
+                    del loaded_patcher
                     saved = state.tensors
                     if mode == "hard":
                         # A plain model state restores its tensors into device memory.
                         reopened = state.load(model.init_kv_cache(1, state.metadata["capacity"], device, torch.bfloat16, mtp=bool(mtp)), device)
                         assert all(torch.equal(v.cpu(), saved[k]) for k, v in reopened.state_dict().items())
                         del reopened
+                        state.flush()
                         state.release()
                     if path is not None:
                         state.save(path)
                         assert all(torch.equal(v, saved[k]) for k, v in safetensors.torch.load_file(path).items())
-                    # Node end: the flushed patcher and its model must both be dead with nothing else holding them.
+                    # An ephemeral state without an owner still releases its model at node end.
                     mm.reset_cast_buffers()
                     mm.cleanup_ephemeral_models()
                     assert not mm.EPHEMERAL_MODELS and all(ref() is None for ref in dead), (mode, dead)
@@ -131,7 +135,7 @@ with torch.inference_mode(), tempfile.TemporaryDirectory() as tmp:
                     turn = source.copy()
                     assert turn.metadata == source.metadata and turn.metadata is not source.metadata
                     assert all(torch.equal(v, saved[k]) for k, v in turn.tensors.items())
-                    restored = turn.load(model.init_kv_cache(1, turn.metadata["capacity"], device, torch.bfloat16, mtp=bool(mtp)), device)
+                    restored = model.init_kv_cache(1, turn.metadata["capacity"], device, torch.bfloat16, mtp=bool(mtp)).load(turn, device)
                     restored.restore_state(turn.metadata["caches"])
                     resumed = original_forward(None, embeds=continuation, attention_mask=None, past_key_values=restored.caches)[0].clone()
                     prefetch.cleanup_prefetch_queues()
@@ -150,6 +154,42 @@ with torch.inference_mode(), tempfile.TemporaryDirectory() as tmp:
                     if mode in ("ram", "disk"):
                         assert not captured
                     print("QWEN_WRITABLE_PASS", attention, length, graphs, queue, mtp, mode, len(ids), len(captured), flush=True)  # noqa: T201
+                if attention == "bf16" and mtp == "3":
+                    mode = "resident"
+                    states.clear()
+                    outputs.clear()
+                    mm.DISABLE_PINNED_MEMORY = False
+                    first = model_state.ModelState()
+                    first.owner = patcher
+                    model.generate(embeds.clone(), do_sample=True, seed=71, max_length=24, mtp=mtp, model_state=first)
+                    managed = first.patcher
+                    turn = first.copy()
+                    reference = model_state.ModelState(dict(turn.tensors), json.loads(json.dumps(turn.metadata)))
+                    prefetch.cleanup_prefetch_queues()
+                    mm.reset_cast_buffers()
+                    mm.cleanup_ephemeral_models()
+                    assert turn.patcher is managed and patcher.get_attachment("model_state_model")[1] is managed
+                    runs = []
+                    for current in (turn, reference):
+                        outputs.clear()
+                        captured.clear()
+                        if current is reference:
+                            mm.register_ephemeral_model(current)
+                        ids = model.generate(continuation.clone(), do_sample=True, seed=71, max_length=8, mtp=mtp, model_state=current)
+                        if current is turn:
+                            assert current.patcher is managed
+                        if graphs:
+                            assert captured
+                        runs.append((ids, list(outputs)))
+                        prefetch.cleanup_prefetch_queues()
+                        mm.reset_cast_buffers()
+                        mm.cleanup_ephemeral_models()
+                    assert runs[0][0] == runs[1][0] and len(runs[0][1]) == len(runs[1][1])
+                    assert all(torch.equal(a, b) for a, b in zip(runs[0][1], runs[1][1]))
+                    turn.release()
+                    mm.unload_model_and_clones(managed)
+                    assert not mm.EPHEMERAL_MODELS
+                    print("QWEN_PERSISTENT_PASS", graphs, flush=True)  # noqa: T201
     pending = torch.nn.Sequential(ops.WritableWeight((1,), torch.float32))
     pending.comfy_writable = True
     output = torch.empty(2 ** 20, device=device)
