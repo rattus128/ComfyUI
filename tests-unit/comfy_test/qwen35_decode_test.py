@@ -340,6 +340,60 @@ def _tiny_model(monkeypatch, layers=4, head_dim=64):
     return model
 
 
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_generation_head_keeps_int8_weights_with_different_compute_dtype(monkeypatch, weight_dtype, batch):
+    from comfy.quant_ops import QuantizedTensor
+    from comfy.text_encoders.llama import BaseGenerate
+
+    torch.manual_seed(0)
+    weight = QuantizedTensor.from_float(torch.randn(32, 256, dtype=weight_dtype), "TensorWiseINT8Layout")
+    head = comfy.ops.mixed_precision_ops(compute_dtype=weight_dtype).Linear(256, 32, bias=False)
+    head.weight = torch.nn.Parameter(weight, requires_grad=False)
+    head.layout_type = "TensorWiseINT8Layout"
+    head.quant_format = "int8_tensorwise"
+    head.comfy_cast_weights = True
+    generator = types.SimpleNamespace(model=types.SimpleNamespace(lm_head=head))
+    x = torch.randn(batch, 3, 256, dtype=torch.bfloat16)
+
+    def dequantize(self):
+        pytest.fail("generation head dequantized the entire INT8 weight")
+
+    def forward(input, weight, bias):
+        assert input.ndim == 2
+        assert isinstance(weight, QuantizedTensor)
+        assert weight._qdata.dtype == torch.int8
+        assert weight.dtype == input.dtype
+        return input[..., :32]
+
+    monkeypatch.setattr(QuantizedTensor, "dequantize", dequantize)
+    monkeypatch.setattr(head, "_forward", forward)
+    assert torch.equal(BaseGenerate.logits(generator, x), x[:, -1:, :32])
+
+
+@pytest.mark.parametrize("cast_weights", [False, True])
+def test_generation_tied_embedding_still_projects_rows(cast_weights):
+    from comfy.text_encoders.llama import BaseGenerate
+
+    embed = comfy.ops.manual_cast.Embedding(17, 8, dtype=torch.float32)
+    embed.weight.data.normal_()
+    embed.comfy_cast_weights = cast_weights
+    generator = types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embed))
+    x = torch.randn(1, 3, 8)
+    expected = torch.nn.functional.linear(x[:, -1:], embed.weight)
+    assert torch.equal(BaseGenerate.logits(generator, x), expected)
+
+
+@pytest.mark.parametrize("mtp", [False, "3"])
+def test_generation_uses_head_forward(monkeypatch, mtp):
+    model = _tiny_model(monkeypatch)
+    rows = []
+    model.model.lm_head.register_forward_pre_hook(lambda module, inputs: rows.append(inputs[0].shape[-2]))
+    model.generate(torch.randn(1, 5, 64), do_sample=False, max_length=8, mtp=mtp)
+    assert rows
+    assert any(n > 1 for n in rows) if mtp else all(n == 1 for n in rows)
+
+
 @pytest.mark.parametrize("image_prompt", [False, True])
 def test_greedy_mtp_matches_plain_greedy(monkeypatch, image_prompt):
     # chain and tree verify through the kitchen torch paths: GQA prefix + tree merge, deferred DeltaNet
