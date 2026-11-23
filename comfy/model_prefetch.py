@@ -228,7 +228,7 @@ def cleanup_prefetch_queues():
     if first_error is not None:
         raise first_error
 
-def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_graph=False, generator=None, malloc_scope=None):
+def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_graph=False, generator=None, malloc_scope=None, graph_key=None):
     malloc_graph = MALLOC_GRAPHS.get(threading.get_ident())
     if malloc_graph is not None and not malloc_graph._comfy_active:
         malloc_graph = None
@@ -258,6 +258,10 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
     signature = None
     graph_hit = False
     graph = getattr(module, "_comfy_graph", None) if enable_graph else None
+    if graph is not None and graph["key"] != graph_key:
+        _drop_graph(module)
+        GRAPH_WARMED_MODULES.discard(module)
+        graph = None
     if graph is not None:
         signature = comfy_aimdo.model_vbar.vbar_fault(module._v_block)
         if signature is not None:
@@ -322,7 +326,7 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
                 malloc_graph.resume(sync=True)
                 comfy.model_management.current_stream(device).wait_stream(capture_stream)
                 graph.replay()
-                module._comfy_graph = {"graph": graph, "signature": signature}
+                module._comfy_graph = {"graph": graph, "signature": signature, "key": graph_key}
                 malloc_graph._comfy_cuda_graph_modules.add(module)
                 return
         if capture_stream is None:

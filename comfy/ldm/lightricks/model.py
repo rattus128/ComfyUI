@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum
 import functools
 import logging
@@ -14,12 +15,16 @@ import comfy.ldm.modules.attention
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention
 import comfy.ldm.common_dit
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.ops
 import comfy.quant_ops
 
 from .symmetric_patchifier import SymmetricPatchifier, latent_to_pixel_coords
 
 logger = logging.getLogger(__name__)
+
+def graph_input_key(tensors):
+    return tuple((t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) if t is not None else None for t in tensors)
 
 def _log_base(x, base):
     return np.log(x) / np.log(base)
@@ -889,6 +894,9 @@ class LTXBaseModel(torch.nn.Module, ABC):
         """Prepare context for transformer blocks."""
         if self.caption_proj_before_connector is False:
             context = self.caption_projection(context)
+        else:
+            # Give replay a stable allocation-graph address, not the caller's storage.
+            context = context.clone()
 
         context = context.view(batch_size, -1, x.shape[-1])
         return context, attention_mask
@@ -943,6 +951,8 @@ class LTXBaseModel(torch.nn.Module, ABC):
             attention_mask = (attention_mask - 1).to(x_dtype).reshape(
                 (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
             ) * torch.finfo(x_dtype).max
+        elif attention_mask is not None:
+            attention_mask = attention_mask.clone()
         return attention_mask
 
     def forward(
@@ -964,13 +974,17 @@ class LTXBaseModel(torch.nn.Module, ABC):
         Returns:
             Processed output tensor
         """
-        return comfy.patcher_extension.WrapperExecutor.new_class_executor(
-            self._forward,
-            self,
-            comfy.patcher_extension.get_all_wrappers(
-                comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options
-            ),
-        ).execute(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
+        device = x[0].device if isinstance(x, list) else x.device
+        # The extra STG pass changes both the batch size and the block trace.
+        scope = nullcontext() if transformer_options.get("stg_self_attn_blocks") else comfy.model_prefetch.malloc_graph_scope(device)
+        with scope:
+            return comfy.patcher_extension.WrapperExecutor.new_class_executor(
+                self._forward,
+                self,
+                comfy.patcher_extension.get_all_wrappers(
+                    comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options
+                ),
+            ).execute(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
 
     def _forward(
         self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
@@ -1024,9 +1038,10 @@ class LTXBaseModel(torch.nn.Module, ABC):
             **merged_args,
         )
 
-        # Process output
-        x = self._process_output(x, embedded_timestep, keyframe_idxs, **merged_args)
-        return x
+        # Returned tensors must outlive the allocation scope.
+        with comfy.model_prefetch.pause_malloc_graph():
+            output = self._process_output(x, embedded_timestep, keyframe_idxs, **merged_args)
+        return output
 
 
 class LTXVModel(LTXBaseModel):
@@ -1390,28 +1405,41 @@ class LTXVModel(LTXBaseModel):
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})
         prompt_timestep = kwargs.get("prompt_timestep", None)
+        prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.transformer_blocks), x.device, transformer_options)
+        mask_tensors = (self_attention_mask.noisy_mask, self_attention_mask.tracked_mask) if isinstance(self_attention_mask, GuideAttentionMask) else (self_attention_mask,)
+        graph_key = graph_input_key((x, context, attention_mask, timestep, pe[0], prompt_timestep, *mask_tensors)) + (transformer_options.get("stg_skip_self_attn", False),)
+        enable_graph = not blocks_replace and not transformer_options.get("patches") and "optimized_attention_override" not in transformer_options
 
         for i, block in enumerate(self.transformer_blocks):
-            if ("double_block", i) in blocks_replace:
+            def core():
+                nonlocal x
+                if ("double_block", i) in blocks_replace:
 
-                def block_wrap(args):
-                    out = {}
-                    out["img"] = block(args["img"], context=args["txt"], attention_mask=args["attention_mask"], timestep=args["vec"], pe=args["pe"], transformer_options=args["transformer_options"], self_attention_mask=args.get("self_attention_mask"), prompt_timestep=args.get("prompt_timestep"))
-                    return out
+                    def block_wrap(args):
+                        out = {}
+                        out["img"] = block(args["img"], context=args["txt"], attention_mask=args["attention_mask"], timestep=args["vec"], pe=args["pe"], transformer_options=args["transformer_options"], self_attention_mask=args.get("self_attention_mask"), prompt_timestep=args.get("prompt_timestep"))
+                        return out
 
-                out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "attention_mask": attention_mask, "vec": timestep, "pe": pe, "transformer_options": transformer_options, "self_attention_mask": self_attention_mask, "prompt_timestep": prompt_timestep}, {"original_block": block_wrap})
-                x = out["img"]
-            else:
-                x = block(
-                    x,
-                    context=context,
-                    attention_mask=attention_mask,
-                    timestep=timestep,
-                    pe=pe,
-                    transformer_options=transformer_options,
-                    self_attention_mask=self_attention_mask,
-                    prompt_timestep=prompt_timestep,
-                )
+                    out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "attention_mask": attention_mask, "vec": timestep, "pe": pe, "transformer_options": transformer_options, "self_attention_mask": self_attention_mask, "prompt_timestep": prompt_timestep}, {"original_block": block_wrap})
+                    x = out["img"]
+                else:
+                    x = block(
+                        x,
+                        context=context,
+                        attention_mask=attention_mask,
+                        timestep=timestep,
+                        pe=pe,
+                        transformer_options=transformer_options,
+                        self_attention_mask=self_attention_mask,
+                        prompt_timestep=prompt_timestep,
+                    )
+
+            comfy.model_prefetch.prefetch_queue_pop(
+                prefetch_queue, x.device, block, x.dtype, core=core, enable_graph=enable_graph,
+                malloc_scope="block", graph_key=graph_key,
+            )
+
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, x.device, None, malloc_scope="block")
 
         return x
 

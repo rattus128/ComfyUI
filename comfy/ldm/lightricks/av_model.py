@@ -10,8 +10,10 @@ from comfy.ldm.lightricks.model import (
     PixArtAlphaTextProjection,
     NormSingleLinearTextProjection,
     LTXVModel,
+    GuideAttentionMask,
     apply_cross_attention_adaln,
     compute_prompt_timestep,
+    graph_input_key,
 )
 from comfy.ldm.lightricks.symmetric_patchifier import AudioPatchifier
 from comfy.ldm.lightricks.embeddings_connector import Embeddings1DConnector
@@ -864,6 +866,8 @@ class LTXAVModel(LTXVModel):
         )
         if self.caption_proj_before_connector is False:
             a_context = self.audio_caption_projection(a_context)
+        else:
+            a_context = a_context.clone()
         a_context = a_context.view(batch_size, -1, audio_dim)
 
         return [v_context, a_context], attention_mask
@@ -936,17 +940,23 @@ class LTXAVModel(LTXVModel):
 
         # Blocks whose self-attention should be perturbed to a value-passthrough (STG).
         stg_self_attn_blocks = transformer_options.get("stg_self_attn_blocks", ())
+        mask_tensors = (self_attention_mask.noisy_mask, self_attention_mask.tracked_mask) if isinstance(self_attention_mask, GuideAttentionMask) else (self_attention_mask,)
+        graph_key = graph_input_key((
+            vx, ax, v_context, a_context, attention_mask, v_timestep.data, a_timestep,
+            v_pe[0], a_pe[0], av_cross_video_freq_cis[0], av_cross_audio_freq_cis[0],
+            av_ca_audio_scale_shift_timestep, av_ca_video_scale_shift_timestep.data,
+            av_ca_a2v_gate_noise_timestep.data, av_ca_v2a_gate_noise_timestep,
+            v_prompt_timestep, a_prompt_timestep, *mask_tensors,
+        )) + (v_timestep.patches_per_frame, av_ca_video_scale_shift_timestep.patches_per_frame, av_ca_a2v_gate_noise_timestep.patches_per_frame)
+        enable_graph = not blocks_replace and not transformer_options.get("patches") and "optimized_attention_override" not in transformer_options
 
         # Process transformer blocks
-        comfy.model_prefetch.malloc_graph_begin(vx.device)
         for i, block in enumerate(self.transformer_blocks):
-            comfy.model_prefetch.prefetch_queue_pop(
-                prefetch_queue, vx.device, block, malloc_scope="block"
-            )
             block_transformer_options = transformer_options
             if i in stg_self_attn_blocks:
                 block_transformer_options = {**transformer_options, "stg_skip_self_attn": True}
             if ("double_block", i) in blocks_replace:
+                comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, vx.device, block, malloc_scope="block")
 
                 def block_wrap(args):
                     out = {}
@@ -997,31 +1007,38 @@ class LTXAVModel(LTXVModel):
                 )
                 vx, ax = out["img"]
             else:
-                vx, ax = block(
-                    (vx, ax),
-                    v_context=v_context,
-                    a_context=a_context,
-                    attention_mask=attention_mask,
-                    v_timestep=v_timestep,
-                    a_timestep=a_timestep,
-                    v_pe=v_pe,
-                    a_pe=a_pe,
-                    v_cross_pe=av_cross_video_freq_cis,
-                    a_cross_pe=av_cross_audio_freq_cis,
-                    v_cross_scale_shift_timestep=av_ca_video_scale_shift_timestep,
-                    a_cross_scale_shift_timestep=av_ca_audio_scale_shift_timestep,
-                    v_cross_gate_timestep=av_ca_a2v_gate_noise_timestep,
-                    a_cross_gate_timestep=av_ca_v2a_gate_noise_timestep,
-                    transformer_options=block_transformer_options,
-                    self_attention_mask=self_attention_mask,
-                    v_prompt_timestep=v_prompt_timestep,
-                    a_prompt_timestep=a_prompt_timestep,
+                def core():
+                    nonlocal vx, ax
+                    vx, ax = block(
+                        (vx, ax),
+                        v_context=v_context,
+                        a_context=a_context,
+                        attention_mask=attention_mask,
+                        v_timestep=v_timestep,
+                        a_timestep=a_timestep,
+                        v_pe=v_pe,
+                        a_pe=a_pe,
+                        v_cross_pe=av_cross_video_freq_cis,
+                        a_cross_pe=av_cross_audio_freq_cis,
+                        v_cross_scale_shift_timestep=av_ca_video_scale_shift_timestep,
+                        a_cross_scale_shift_timestep=av_ca_audio_scale_shift_timestep,
+                        v_cross_gate_timestep=av_ca_a2v_gate_noise_timestep,
+                        a_cross_gate_timestep=av_ca_v2a_gate_noise_timestep,
+                        transformer_options=block_transformer_options,
+                        self_attention_mask=self_attention_mask,
+                        v_prompt_timestep=v_prompt_timestep,
+                        a_prompt_timestep=a_prompt_timestep,
+                    )
+
+                block_graph_key = graph_key + tuple(block_transformer_options.get(key, True) for key in ("run_vx", "run_ax", "a2v_cross_attn", "v2a_cross_attn")) + (block_transformer_options.get("stg_skip_self_attn", False),)
+                comfy.model_prefetch.prefetch_queue_pop(
+                    prefetch_queue, vx.device, block, vx.dtype, core=core, enable_graph=enable_graph,
+                    malloc_scope="block", graph_key=block_graph_key,
                 )
 
         comfy.model_prefetch.prefetch_queue_pop(
             prefetch_queue, vx.device, None, malloc_scope="block"
         )
-        comfy.model_prefetch.malloc_graph_end()
 
         return [vx, ax]
 
